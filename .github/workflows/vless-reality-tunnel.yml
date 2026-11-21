@@ -1,18 +1,21 @@
-name: VLESS Reality Tunnel (Xray + bore) with speed test
-
+name: High-Speed VLESS Tunnel (Cloudflare + Reality Backup)
 on:
   workflow_dispatch:
     inputs:
       hours:
         description: "How many hours to keep the tunnel alive (max ~5.6)"
         required: false
-        default: "4"
+        default: "5"
       remark:
         description: "Name of the config in your client app (no spaces)"
         required: false
         default: "GitHub"
+      clean_ip:
+        description: "Clean Cloudflare IP or Domain for WS config"
+        required: false
+        default: "www.speedtest.net"
       sni:
-        description: "Reality camouflage site (must support TLS 1.3 + h2), e.g. dl.google.com / www.speedtest.net / www.samsung.com"
+        description: "Reality camouflage site (for Bore backup tunnel)"
         required: false
         default: "dl.google.com"
 
@@ -20,7 +23,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: vless-reality-tunnel
+  group: vless-hybrid-tunnel
   cancel-in-progress: true
 
 jobs:
@@ -30,28 +33,36 @@ jobs:
     env:
       HOURS: ${{ inputs.hours }}
       REMARK: ${{ inputs.remark }}
+      CLEAN_IP: ${{ inputs.clean_ip }}
       SNI: ${{ inputs.sni }}
-      XRAY_PORT: "10808"
+      PORT_REALITY: "10808"
+      PORT_WS: "10809"
+      WS_PATH: "/vless-ws"
       TEST_URL_SMALL: "https://www.google.com/generate_204"
       TEST_URL_BIG: "https://speed.cloudflare.com/__down?bytes=30000000"
 
     steps:
-      - name: 1. Install Xray & bore
+      - name: 1. Install Xray, Cloudflared & Bore
         run: |
           set -e
           mkdir -p "$HOME/bin" && cd "$HOME/bin"
-
+          
+          # 1. Install Xray
           curl -fsSL --retry 3 -o xray.zip https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
           unzip -qo xray.zip
-
-          # Resolve the latest bore tag via the redirect (avoids GitHub API rate limits)
+          
+          # 2. Install Cloudflared (Primary High-Speed Tunnel)
+          curl -fsSL --retry 3 -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          
+          # 3. Install Bore (Backup Raw-TCP Tunnel)
           TAG=$(curl -fsSIL -o /dev/null -w '%{url_effective}' https://github.com/ekzhang/bore/releases/latest | sed 's#.*/tag/##')
           curl -fsSL --retry 3 -o bore.tgz "https://github.com/ekzhang/bore/releases/download/${TAG}/bore-${TAG}-x86_64-unknown-linux-musl.tar.gz"
           tar xzf bore.tgz
-
-          chmod +x xray bore
+          
+          chmod +x xray cloudflared bore
           echo "$HOME/bin" >> "$GITHUB_PATH"
           ./xray version | head -1
+          ./cloudflared --version
           ./bore --version
 
       - name: 2. Network tuning (BBR + bigger buffers)
@@ -65,22 +76,17 @@ jobs:
           echo "Congestion control now: $(sysctl -n net.ipv4.tcp_congestion_control)"
           exit 0
 
-      - name: 3. Generate Reality keys & Xray config
+      - name: 3. Generate Keys & Dual-Inbound Xray Config
         run: |
           set -e
-          UUID_A=$(cat /proc/sys/kernel/random/uuid)   # config A: Vision (no mux)
-          UUID_B=$(cat /proc/sys/kernel/random/uuid)   # config B: plain Reality, use with Mux enabled in the client
+          UUID=$(cat /proc/sys/kernel/random/uuid)
           SID=$(head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n')
-
-          # Line 1 = private key, line 2 = public key (works with old and new Xray output formats)
           KEYS=$(xray x25519)
           PRIV=$(echo "$KEYS" | sed -n '1p' | awk '{print $NF}')
           PUB=$(echo "$KEYS"  | sed -n '2p' | awk '{print $NF}')
-          if [ -z "$PRIV" ] || [ -z "$PUB" ]; then echo "Could not generate x25519 keys"; echo "$KEYS"; exit 1; fi
-
+          
           {
-            echo "UUID_A=$UUID_A"
-            echo "UUID_B=$UUID_B"
+            echo "UUID=$UUID"
             echo "SID=$SID"
             echo "PUB=$PUB"
           } >> "$GITHUB_ENV"
@@ -88,31 +94,47 @@ jobs:
           cat > "$HOME/xray.json" <<EOF
           {
             "log": { "loglevel": "warning" },
-            "inbounds": [{
-              "listen": "127.0.0.1",
-              "port": $XRAY_PORT,
-              "protocol": "vless",
-              "settings": {
-                "clients": [
-                  { "id": "$UUID_A", "flow": "xtls-rprx-vision" },
-                  { "id": "$UUID_B" }
-                ],
-                "decryption": "none"
+            "inbounds": [
+              {
+                "tag": "in-ws",
+                "listen": "127.0.0.1",
+                "port": $PORT_WS,
+                "protocol": "vless",
+                "settings": {
+                  "clients": [{ "id": "$UUID" }],
+                  "decryption": "none"
+                },
+                "streamSettings": {
+                  "network": "ws",
+                  "security": "none",
+                  "wsSettings": { "path": "$WS_PATH" }
+                },
+                "sniffing": { "enabled": true, "destOverride": ["http", "tls"], "routeOnly": true }
               },
-              "streamSettings": {
-                "network": "tcp",
-                "security": "reality",
-                "realitySettings": {
-                  "show": false,
-                  "dest": "$SNI:443",
-                  "xver": 0,
-                  "serverNames": ["$SNI"],
-                  "privateKey": "$PRIV",
-                  "shortIds": ["$SID"]
-                }
-              },
-              "sniffing": { "enabled": true, "destOverride": ["http", "tls"], "routeOnly": true }
-            }],
+              {
+                "tag": "in-reality",
+                "listen": "127.0.0.1",
+                "port": $PORT_REALITY,
+                "protocol": "vless",
+                "settings": {
+                  "clients": [{ "id": "$UUID", "flow": "xtls-rprx-vision" }],
+                  "decryption": "none"
+                },
+                "streamSettings": {
+                  "network": "tcp",
+                  "security": "reality",
+                  "realitySettings": {
+                    "show": false,
+                    "dest": "$SNI:443",
+                    "xver": 0,
+                    "serverNames": ["$SNI"],
+                    "privateKey": "$PRIV",
+                    "shortIds": ["$SID"]
+                  }
+                },
+                "sniffing": { "enabled": true, "destOverride": ["http", "tls"], "routeOnly": true }
+              }
+            ],
             "outbounds": [
               { "protocol": "freedom", "tag": "direct", "settings": { "domainStrategy": "UseIPv4" } },
               { "protocol": "blackhole", "tag": "block" }
@@ -125,189 +147,191 @@ jobs:
             }
           }
           EOF
-
           xray run -test -config "$HOME/xray.json"
 
-      - name: 4. Start tunnel, speed test, print configs & keep alive
+      - name: 4. Start Tunnels, Speed Test, Print Configs & Keep Alive
         run: |
           set +e
           ulimit -n 65535 2>/dev/null
-
-          LOG="$HOME/tunnel.log"
-          XRAY_PID=""; TUN_PID=""; REMOTE_HOST=""; REMOTE_PORT=""; IP=""
+          CF_LOG="$HOME/cf.log"
+          BORE_LOG="$HOME/bore.log"
+          XRAY_PID=""; CF_PID=""; BORE_PID=""
+          CF_DOMAIN=""; BORE_PORT=""; BORE_IP=""
 
           start_xray() {
             setsid nohup xray run -config "$HOME/xray.json" > "$HOME/xray.log" 2>&1 &
             XRAY_PID=$!
           }
 
-          # bore: raw TCP relay. $1 = wanted remote port (0 = random)
-          start_bore() {
-            : > "$LOG"
-            RUST_LOG=info setsid nohup bore local "$XRAY_PORT" --local-host 127.0.0.1 --to bore.pub --port "${1:-0}" > "$LOG" 2>&1 &
-            TUN_PID=$!
-            for _ in $(seq 1 20); do
-              R=$(grep -oE 'bore\.pub:[0-9]+' "$LOG" | head -1)
-              if [ -n "$R" ]; then REMOTE_HOST="bore.pub"; REMOTE_PORT="${R#bore.pub:}"; return 0; fi
-              kill -0 "$TUN_PID" 2>/dev/null || return 1
+          start_cf() {
+            : > "$CF_LOG"
+            setsid nohup cloudflared tunnel --url "http://127.0.0.1:$PORT_WS" --no-autoupdate --edge-ip-version 4 --protocol http2 > "$CF_LOG" 2>&1 &
+            CF_PID=$!
+            for _ in $(seq 1 30); do
+              D=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' "$CF_LOG" | head -1 | sed 's#https://##')
+              if [ -n "$D" ]; then CF_DOMAIN="$D"; return 0; fi
+              kill -0 "$CF_PID" 2>/dev/null || return 1
               sleep 1
             done
-            kill "$TUN_PID" 2>/dev/null
+            kill "$CF_PID" 2>/dev/null
             return 1
           }
 
-          make_link() {   # $1 = uuid, $2 = flow part, $3 = name
-            echo "vless://$1@${IP}:${REMOTE_PORT}?encryption=none${2}&security=reality&sni=${SNI}&fp=chrome&pbk=${PUB}&sid=${SID}&type=tcp&headerType=none#${REMARK}-$3"
+          start_bore() {
+            : > "$BORE_LOG"
+            RUST_LOG=info setsid nohup bore local "$PORT_REALITY" --local-host 127.0.0.1 --to bore.pub --port "${1:-0}" > "$BORE_LOG" 2>&1 &
+            BORE_PID=$!
+            for _ in $(seq 1 20); do
+              R=$(grep -oE 'bore\.pub:[0-9]+' "$BORE_LOG" | head -1)
+              if [ -n "$R" ]; then
+                BORE_PORT="${R#bore.pub:}"
+                BORE_IP=$(getent ahostsv4 "bore.pub" 2>/dev/null | awk '{print $1; exit}')
+                [ -z "$BORE_IP" ] && BORE_IP="bore.pub"
+                return 0
+              fi
+              kill -0 "$BORE_PID" 2>/dev/null || return 1
+              sleep 1
+            done
+            kill "$BORE_PID" 2>/dev/null
+            return 1
           }
 
           announce() {
-            # Use the raw IP in the link (no DNS name for filters to match on)
-            IP=$(getent ahostsv4 "$REMOTE_HOST" 2>/dev/null | awk '{print $1; exit}')
-            [ -z "$IP" ] && IP="$REMOTE_HOST"
-
-            LINK_A=$(make_link "$UUID_A" "&flow=xtls-rprx-vision" "Vision")
-            LINK_B=$(make_link "$UUID_B" "" "Mux")
-
-            echo "Self-test through the public tunnel..."
-            CERT=$(timeout 20 openssl s_client -connect "${IP}:${REMOTE_PORT}" -servername "$SNI" </dev/null 2>/dev/null | grep -i 'subject=' | head -1)
-            if [ -n "$CERT" ]; then echo "Self-test OK -> $CERT"; else echo "Self-test: no certificate returned (check the logs if the configs do not work)"; fi
+            ENC_PATH=$(echo "$WS_PATH" | sed 's#/#%2F#g')
+            LINK_CF_CLEAN="vless://${UUID}@${CLEAN_IP}:443?encryption=none&security=tls&sni=${CF_DOMAIN}&fp=chrome&alpn=http%2F1.1&type=ws&host=${CF_DOMAIN}&path=${ENC_PATH}#${REMARK}-CF-Fast"
+            LINK_CF_FRAG="vless://${UUID}@${CLEAN_IP}:443?encryption=none&security=tls&sni=${CF_DOMAIN}&fp=chrome&alpn=http%2F1.1&type=ws&host=${CF_DOMAIN}&path=${ENC_PATH}&fragment=10-20,10-20,tlshello#${REMARK}-CF-Fragment"
+            LINK_REALITY="vless://${UUID}@${BORE_IP}:${BORE_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUB}&sid=${SID}&type=tcp&headerType=none#${REMARK}-Reality-Backup"
 
             echo ""
-            echo "=================================================="
-            echo "  >>> CONFIGS ARE READY! (relay: ${IP}:${REMOTE_PORT}) <<<"
+            echo "=================================================================="
+            echo "  >>> 🚀 CONFIGS ARE READY! <<<"
             echo ""
-            echo "  [A] Vision - normal use:"
-            echo "$LINK_A"
-            echo ""
-            echo "  [B] Mux - turn ON 'Mux' in your client settings, then use this one:"
-            echo "$LINK_B"
-            echo ""
-            echo "  Import from clipboard in v2rayN / v2rayNG / Hiddify / Streisand."
-            echo "  Try both and keep the one that feels faster."
-            echo "=================================================="
+            if [ -n "$CF_DOMAIN" ]; then
+              echo "  [1] 🌟 Cloudflare High-Speed (Clean IP) - RECOMMENDED:"
+              echo "$LINK_CF_CLEAN"
+              echo ""
+              echo "  [2] 🛡️ Cloudflare + TLS Fragment (Use if [1] fails on your ISP):"
+              echo "$LINK_CF_FRAG"
+              echo ""
+            fi
+            if [ -n "$BORE_PORT" ]; then
+              echo "  [3] 🔄 Reality Backup (bore.pub:${BORE_PORT}):"
+              echo "$LINK_REALITY"
+              echo ""
+            fi
+            echo "  Tip: If using v2rayNG / Hiddify / MahsaNG, enable 'Mux' or 'Fragment'"
+            echo "  in your app settings for maximum stability."
+            echo "=================================================================="
 
             {
-              echo "### 🚀 Configs ($(date +%H:%M) UTC) - relay \`${IP}:${REMOTE_PORT}\`"
-              echo ""
-              echo "**A - Vision**"
-              echo '```'
-              echo "$LINK_A"
-              echo '```'
-              echo "**B - Mux** (enable Mux in the client app)"
-              echo '```'
-              echo "$LINK_B"
-              echo '```'
-              echo ""
+              echo "### 🚀 Configs ($(date +%H:%M) UTC)"
+              if [ -n "$CF_DOMAIN" ]; then
+                echo "#### 1. 🌟 Cloudflare High-Speed (Clean IP - Recommended)"
+                echo '```'
+                echo "$LINK_CF_CLEAN"
+                echo '```'
+                echo "#### 2. 🛡️ Cloudflare + Fragment (For strict ISPs)"
+                echo '```'
+                echo "$LINK_CF_FRAG"
+                echo '```'
+              fi
+              if [ -n "$BORE_PORT" ]; then
+                echo "#### 3. 🔄 Reality Backup (\`${BORE_IP}:${BORE_PORT}\`)"
+                echo '```'
+                echo "$LINK_REALITY"
+                echo '```'
+              fi
             } >> "$GITHUB_STEP_SUMMARY"
-          }
-
-          # One speed test through the PUBLIC relay path, like a real client would use it.
-          # $1 label, $2 uuid, $3 flow ("" or xtls-rprx-vision), $4 mux (0/1)
-          run_test() {
-            local label="$1" id="$2" flow="$3" mux="$4" CPORT=10809 FLOWJSON="" MUXJSON=""
-            [ -n "$flow" ] && FLOWJSON=",\"flow\":\"$flow\""
-            [ "$mux" = "1" ] && MUXJSON=',"mux":{"enabled":true,"concurrency":8}'
-            printf '{"log":{"loglevel":"warning"},"inbounds":[{"listen":"127.0.0.1","port":%s,"protocol":"socks","settings":{"udp":false}}],"outbounds":[{"protocol":"vless","settings":{"vnext":[{"address":"%s","port":%s,"users":[{"id":"%s","encryption":"none"%s}]}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":"%s","fingerprint":"chrome","publicKey":"%s","shortId":"%s"}}%s}]}\n' \
-              "$CPORT" "$IP" "$REMOTE_PORT" "$id" "$FLOWJSON" "$SNI" "$PUB" "$SID" "$MUXJSON" > "$HOME/client-test.json"
-
-            xray run -config "$HOME/client-test.json" > "$HOME/client-test.log" 2>&1 &
-            local CPID=$!
-            sleep 3
-
-            local SOCKS="socks5h://127.0.0.1:$CPORT" total=0 ok=0 n T
-            for n in 1 2 3 4 5 6; do
-              T=$(curl -s -o /dev/null --max-time 15 -x "$SOCKS" -w '%{time_total}' "$TEST_URL_SMALL")
-              if [ $? -eq 0 ]; then ok=$((ok + 1)); total=$(awk -v a="$total" -v b="$T" 'BEGIN { print a + b }'); fi
-            done
-            local AVG="n/a"
-            [ "$ok" -gt 0 ] && AVG=$(awk -v t="$total" -v k="$ok" 'BEGIN { printf "%.2f", t / k }')
-
-            local SPEED
-            SPEED=$(curl -sL -o /dev/null --max-time 15 -x "$SOCKS" -w '%{speed_download}' "$TEST_URL_BIG")
-            local MBPS
-            MBPS=$(awk -v s="${SPEED:-0}" 'BEGIN { printf "%.1f", s * 8 / 1000000 }')
-
-            printf '  %-18s new-connection time: %s s (%d/6 ok) | download: %s Mbps\n' "$label" "$AVG" "$ok" "$MBPS"
-            kill "$CPID" 2>/dev/null
-            wait "$CPID" 2>/dev/null
           }
 
           speed_test() {
             echo ""
             echo "=================== SPEED TEST ==================="
-            echo "(measured from this server through the public relay and back,"
-            echo " so it shows the relay's own limit, not your internet or ISP)"
             local D
             D=$(curl -sL -o /dev/null --max-time 15 -w '%{speed_download}' "$TEST_URL_BIG")
-            printf '  %-18s download: %s Mbps\n' "Direct (no relay)" "$(awk -v s="${D:-0}" 'BEGIN { printf "%.1f", s * 8 / 1000000 }')"
-            run_test "A Vision" "$UUID_A" "xtls-rprx-vision" 0
-            run_test "B Mux" "$UUID_B" "" 1
-            echo "---------------------------------------------------"
-            echo " Good relay : new-connection time under ~1.5 s and download of 20+ Mbps."
-            echo " Bad relay  : slow numbers here mean bore.pub itself is the limit."
-            echo " Good numbers here but slow on your laptop = the path between your"
-            echo " ISP and the relay's IP is being throttled (not fixable from this file)."
+            printf '  %-22s download: %s Mbps\n' "Direct Runner" "$(awk -v s="${D:-0}" 'BEGIN { printf "%.1f", s * 8 / 1000000 }')"
+
+            # Test Cloudflare Tunnel
+            if [ -n "$CF_DOMAIN" ]; then
+              sleep 5 # Wait for DNS propagation
+              cat > "$HOME/test-cf.json" <<EOF
+              {"log":{"loglevel":"none"},"inbounds":[{"listen":"127.0.0.1","port":10810,"protocol":"socks"}],"outbounds":[{"protocol":"vless","settings":{"vnext":[{"address":"$CLEAN_IP","port":443,"users":[{"id":"$UUID","encryption":"none"}]}]},"streamSettings":{"network":"ws","security":"tls","tlsSettings":{"serverName":"$CF_DOMAIN","fingerprint":"chrome"},"wsSettings":{"path":"$WS_PATH","headers":{"Host":"$CF_DOMAIN"}}}}]}
+          EOF
+              xray run -config "$HOME/test-cf.json" >/dev/null 2>&1 &
+              local PID_T=$!
+              sleep 3
+              local T SPEED
+              T=$(curl -s -o /dev/null --max-time 15 -x "socks5h://127.0.0.1:10810" -w '%{time_total}' "$TEST_URL_SMALL")
+              SPEED=$(curl -sL -o /dev/null --max-time 15 -x "socks5h://127.0.0.1:10810" -w '%{speed_download}' "$TEST_URL_BIG")
+              printf '  %-22s latency: %s s | download: %s Mbps\n' "1. Cloudflare WS" "$T" "$(awk -v s="${SPEED:-0}" 'BEGIN { printf "%.1f", s * 8 / 1000000 }')"
+              kill "$PID_T" 2>/dev/null; wait "$PID_T" 2>/dev/null
+            fi
+
+            # Test Bore Reality Tunnel
+            if [ -n "$BORE_PORT" ]; then
+              cat > "$HOME/test-bore.json" <<EOF
+              {"log":{"loglevel":"none"},"inbounds":[{"listen":"127.0.0.1","port":10811,"protocol":"socks"}],"outbounds":[{"protocol":"vless","settings":{"vnext":[{"address":"$BORE_IP","port":$BORE_PORT,"users":[{"id":"$UUID","encryption":"none","flow":"xtls-rprx-vision"}]}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":"$SNI","fingerprint":"chrome","publicKey":"$PUB","shortId":"$SID"}}}]}
+          EOF
+              xray run -config "$HOME/test-bore.json" >/dev/null 2>&1 &
+              local PID_B=$!
+              sleep 3
+              local TB SPEEDB
+              TB=$(curl -s -o /dev/null --max-time 15 -x "socks5h://127.0.0.1:10811" -w '%{time_total}' "$TEST_URL_SMALL")
+              SPEEDB=$(curl -sL -o /dev/null --max-time 15 -x "socks5h://127.0.0.1:10811" -w '%{speed_download}' "$TEST_URL_BIG")
+              printf '  %-22s latency: %s s | download: %s Mbps\n' "2. Bore Reality" "$TB" "$(awk -v s="${SPEEDB:-0}" 'BEGIN { printf "%.1f", s * 8 / 1000000 }')"
+              kill "$PID_B" 2>/dev/null; wait "$PID_B" 2>/dev/null
+            fi
             echo "==================================================="
             echo ""
           }
 
-          # ---- first start ----
+          # ---- Start Everything ----
           start_xray
           sleep 2
 
-          OK=0
-          for t in 1 2 3 4 5; do
-            if start_bore 0; then OK=1; break; fi
-            echo "Tunnel start attempt $t failed:"; tail -5 "$LOG"; sleep 5
-          done
-          if [ "$OK" -eq 0 ]; then echo "Could not start the tunnel."; exit 1; fi
+          echo "Starting Cloudflare Tunnel..."
+          for _ in 1 2 3; do start_cf && break; sleep 3; done
+
+          echo "Starting Bore Backup Tunnel..."
+          for _ in 1 2 3; do start_bore 0 && break; sleep 3; done
+
+          if [ -z "$CF_DOMAIN" ] && [ -z "$BORE_PORT" ]; then
+            echo "Both tunnels failed to start."
+            exit 1
+          fi
 
           announce
           speed_test
 
-          # ---- keep alive (stay under GitHub's 360-minute job limit) ----
+          # ---- Keep Alive Loop ----
           MINUTES=$(awk -v h="$HOURS" 'BEGIN { m = h * 60; if (m > 340) m = 340; printf "%d", m }')
           END=$(( $(date +%s) + MINUTES * 60 ))
-          echo "Tunnel stays up for ~${MINUTES} minutes. Cancel the run to stop earlier."
-
+          echo "Tunnels stay up for ~${MINUTES} minutes."
           TICK=0
+
           while [ "$(date +%s)" -lt "$END" ]; do
             sleep 10
             TICK=$((TICK + 1))
 
-            # Xray died -> restart it
             if ! kill -0 "$XRAY_PID" 2>/dev/null; then
-              echo "Xray died, restarting. Last log lines:"; tail -5 "$HOME/xray.log"
+              echo "Xray died, restarting..."
               start_xray
             fi
 
-            # Tunnel died -> reconnect on the SAME port, so your existing configs keep working
-            if ! kill -0 "$TUN_PID" 2>/dev/null; then
-              echo "Tunnel dropped at $(date +%T). Last log lines:"; tail -5 "$LOG"
-              OLD_PORT="$REMOTE_PORT"; OK=0
+            if [ -n "$CF_DOMAIN" ] && ! kill -0 "$CF_PID" 2>/dev/null; then
+              echo "Cloudflare tunnel dropped! Reconnecting..."
+              if start_cf; then announce; fi
+            fi
 
-              for t in 1 2 3 4 5; do
-                sleep 3
-                if start_bore "$OLD_PORT"; then OK=1; break; fi
-              done
-              if [ "$OK" -eq 0 ]; then
-                for t in 1 2 3 4 5; do
-                  if start_bore 0; then OK=1; break; fi
-                  sleep 5
-                done
-              fi
-              if [ "$OK" -eq 0 ]; then echo "Could not reconnect the tunnel."; exit 1; fi
-
-              if [ "$REMOTE_PORT" = "$OLD_PORT" ]; then
-                echo "Reconnected on the SAME port -> your current configs still work."
-              else
-                echo "The port changed -> import the NEW links below:"
-                announce
-              fi
+            if [ -n "$BORE_PORT" ] && ! kill -0 "$BORE_PID" 2>/dev/null; then
+              echo "Bore tunnel dropped! Reconnecting..."
+              OLD_PORT="$BORE_PORT"
+              if ! start_bore "$OLD_PORT"; then start_bore 0; fi
+              if [ "$BORE_PORT" != "$OLD_PORT" ]; then announce; fi
             fi
 
             if [ $((TICK % 6)) -eq 0 ]; then
-              echo "[$((TICK / 6))] Tunnel running... ~$(( (END - $(date +%s)) / 60 )) min left"
+              echo "[$((TICK / 6))] Running smoothly... ~$(( (END - $(date +%s)) / 60 )) min left"
             fi
           done
           echo "Time is up, shutting down."
