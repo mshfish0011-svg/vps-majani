@@ -1,0 +1,136 @@
+name: VLESS Tunnel (Xray + Cloudflare)
+
+on:
+  workflow_dispatch:
+    inputs:
+      hours:
+        description: "How many hours to keep the tunnel alive (max ~5.6)"
+        required: false
+        default: "4"
+      remark:
+        description: "Name of the config in your client app (no spaces)"
+        required: false
+        default: "GitHub-VLESS"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vless-tunnel
+  cancel-in-progress: true
+
+jobs:
+  tunnel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      HOURS: ${{ inputs.hours }}
+      REMARK: ${{ inputs.remark }}
+      XRAY_PORT: "10808"
+
+    steps:
+      - name: 1. Install Xray & cloudflared
+        run: |
+          set -e
+          mkdir -p "$HOME/bin" && cd "$HOME/bin"
+          curl -fsSL --retry 3 -o xray.zip https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
+          unzip -qo xray.zip
+          curl -fsSL --retry 3 -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x xray cloudflared
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          ./xray version | head -1
+          ./cloudflared --version
+
+      - name: 2. Generate Xray config (VLESS over WebSocket)
+        run: |
+          set -e
+          UUID=$(cat /proc/sys/kernel/random/uuid)
+          WSPATH="/$(head -c 32 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 12)"
+          echo "UUID=$UUID" >> "$GITHUB_ENV"
+          echo "WSPATH=$WSPATH" >> "$GITHUB_ENV"
+
+          cat > "$HOME/xray.json" <<EOF
+          {
+            "log": { "loglevel": "warning" },
+            "inbounds": [{
+              "listen": "127.0.0.1",
+              "port": $XRAY_PORT,
+              "protocol": "vless",
+              "settings": { "clients": [{ "id": "$UUID" }], "decryption": "none" },
+              "streamSettings": { "network": "ws", "wsSettings": { "path": "$WSPATH" } },
+              "sniffing": { "enabled": true, "destOverride": ["http", "tls"] }
+            }],
+            "outbounds": [
+              { "protocol": "freedom", "tag": "direct" },
+              { "protocol": "blackhole", "tag": "block" }
+            ],
+            "routing": {
+              "rules": [
+                { "type": "field", "protocol": ["bittorrent"], "outboundTag": "block" },
+                { "type": "field", "ip": ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16"], "outboundTag": "block" }
+              ]
+            }
+          }
+          EOF
+
+          xray run -test -config "$HOME/xray.json"
+
+      - name: 3. Start tunnel, print config & keep alive
+        run: |
+          # Start Xray
+          setsid nohup xray run -config "$HOME/xray.json" > "$HOME/xray.log" 2>&1 &
+          XRAY_PID=$!
+          sleep 2
+
+          # Start Cloudflare quick tunnel (gives a free public https URL)
+          setsid nohup cloudflared tunnel --no-autoupdate --url "http://127.0.0.1:$XRAY_PORT" > "$HOME/cf.log" 2>&1 &
+          CF_PID=$!
+
+          # Wait for the trycloudflare.com address
+          HOST=""
+          for i in $(seq 1 45); do
+            HOST=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$HOME/cf.log" | grep -v '^https://api\.' | head -1 | sed 's#https://##' || true)
+            [ -n "$HOST" ] && break
+            sleep 2
+          done
+          if [ -z "$HOST" ]; then
+            echo "Cloudflare tunnel did not start. Log:"; cat "$HOME/cf.log"; exit 1
+          fi
+
+          ENC_PATH="%2F${WSPATH#/}"
+          LINK="vless://${UUID}@${HOST}:443?encryption=none&security=tls&sni=${HOST}&fp=chrome&alpn=http%2F1.1&type=ws&host=${HOST}&path=${ENC_PATH}#${REMARK}"
+
+          echo ""
+          echo "=================================================="
+          echo "  >>> VLESS CONFIG IS READY! <<<"
+          echo ""
+          echo "$LINK"
+          echo ""
+          echo "  Copy the link above and import it from clipboard"
+          echo "  in v2rayNG / Hiddify / v2rayN / Streisand."
+          echo "=================================================="
+
+          {
+            echo "### 🚀 VLESS config is ready"
+            echo ""
+            echo '```'
+            echo "$LINK"
+            echo '```'
+            echo ""
+            echo "Import it from the clipboard in your client app. The link changes on every run."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Keep alive (stay under GitHub's 360-minute job limit)
+          MINUTES=$(awk -v h="$HOURS" 'BEGIN { m = h * 60; if (m > 340) m = 340; printf "%d", m }')
+          END=$(( $(date +%s) + MINUTES * 60 ))
+          echo "Tunnel stays up for ~${MINUTES} minutes. Cancel the run to stop earlier."
+
+          i=0
+          while [ "$(date +%s)" -lt "$END" ]; do
+            sleep 60
+            i=$((i + 1))
+            if ! kill -0 "$XRAY_PID" 2>/dev/null; then echo "Xray died:"; tail -20 "$HOME/xray.log"; exit 1; fi
+            if ! kill -0 "$CF_PID" 2>/dev/null; then echo "cloudflared died (the link is no longer valid):"; tail -20 "$HOME/cf.log"; exit 1; fi
+            echo "[$i] Tunnel running... ~$(( (END - $(date +%s)) / 60 )) min left"
+          done
+          echo "Time is up, shutting down."
