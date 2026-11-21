@@ -1,4 +1,4 @@
-name: VLESS Cloudflare Turbo (Fast Fragment + Mux + YouTube Fix)
+name: VLESS Cloudflare Fixed (Working Ping + YouTube & Telegram)
 on:
   workflow_dispatch:
     inputs:
@@ -9,17 +9,13 @@ on:
       remark:
         description: "Name of the config in your client app (no spaces)"
         required: false
-        default: "GitHub-Turbo"
-      clean_ip:
-        description: "Clean Cloudflare IP (e.g. 162.159.135.42 / 104.18.2.161 / www.visa.com.sg)"
-        required: false
-        default: "162.159.135.42"
+        default: "GitHub"
 
 permissions:
   contents: read
 
 concurrency:
-  group: vless-turbo-tunnel
+  group: vless-fixed-tunnel
   cancel-in-progress: true
 
 jobs:
@@ -29,9 +25,8 @@ jobs:
     env:
       HOURS: ${{ inputs.hours }}
       REMARK: ${{ inputs.remark }}
-      CLEAN_IP: ${{ inputs.clean_ip }}
       PORT_WS: "10809"
-      WS_PATH: "/ws"
+      WS_PATH: "/vless"
       TEST_URL_SMALL: "https://www.google.com/generate_204"
       TEST_URL_BIG: "https://speed.cloudflare.com/__down?bytes=25000000"
 
@@ -45,30 +40,29 @@ jobs:
           curl -fsSL --retry 3 -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x xray cloudflared
           echo "$HOME/bin" >> "$GITHUB_PATH"
-          ./xray version | head -1
-          ./cloudflared --version
 
-      - name: 2. Network Tuning (BBR + Low Latency)
+      - name: 2. Network Tuning (BBR)
         continue-on-error: true
         run: |
           sudo modprobe tcp_bbr 2>/dev/null || true
           sudo sysctl -w net.core.default_qdisc=fq || true
           sudo sysctl -w net.ipv4.tcp_congestion_control=bbr || true
           sudo sysctl -w net.core.rmem_max=16777216 net.core.wmem_max=16777216 || true
-          sudo sysctl -w net.ipv4.tcp_fastopen=3 || true
           exit 0
 
-      - name: 3. Configure Xray (DNS + QUIC Block for YouTube)
+      - name: 3. Configure Xray Server (FakeDNS & IPv4 Fix)
         run: |
           set -e
           UUID=$(cat /proc/sys/kernel/random/uuid)
           echo "UUID=$UUID" >> "$GITHUB_ENV"
 
+          # CRITICAL FIX: routeOnly MUST be false so FakeDNS from client apps opens YouTube/Telegram!
           cat > "$HOME/xray.json" <<EOF
           {
             "log": { "loglevel": "warning" },
             "dns": {
-              "servers": ["1.1.1.1", "8.8.8.8", "localhost"]
+              "servers": ["1.1.1.1", "8.8.8.8"],
+              "queryStrategy": "UseIPv4"
             },
             "inbounds": [
               {
@@ -87,7 +81,8 @@ jobs:
                 },
                 "sniffing": {
                   "enabled": true,
-                  "destOverride": ["http", "tls", "quic"]
+                  "destOverride": ["http", "tls", "quic"],
+                  "routeOnly": false
                 }
               }
             ],
@@ -107,18 +102,7 @@ jobs:
               "rules": [
                 {
                   "type": "field",
-                  "network": "udp",
-                  "port": "443",
-                  "outboundTag": "block"
-                },
-                {
-                  "type": "field",
                   "protocol": ["bittorrent"],
-                  "outboundTag": "block"
-                },
-                {
-                  "type": "field",
-                  "ip": ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16"],
                   "outboundTag": "block"
                 }
               ]
@@ -127,7 +111,7 @@ jobs:
           EOF
           xray run -test -config "$HOME/xray.json"
 
-      - name: 4. Start Tunnel, Generate Turbo Configs & Keep Alive
+      - name: 4. Start Tunnel & Print Working Configs
         run: |
           set +e
           ulimit -n 65535 2>/dev/null
@@ -156,22 +140,19 @@ jobs:
           announce() {
             ENC_PATH=$(echo "$WS_PATH" | sed 's#/#%2F#g')
             
-            # 1. Fast Fragment Link (100-200 bytes, 1-3ms delay, h2+http/1.1 ALPN)
-            LINK_FRAG_1="vless://${UUID}@${CLEAN_IP}:443?encryption=none&security=tls&sni=${CF_DOMAIN}&fp=chrome&alpn=h2%2Chttp%2F1.1&type=ws&host=${CF_DOMAIN}&path=${ENC_PATH}&fragment=100-200,1-3,tlshello#${REMARK}-FastFrag-1"
-            
-            # 2. Backup Clean IP Link (104.18.2.161)
-            LINK_FRAG_2="vless://${UUID}@104.18.2.161:443?encryption=none&security=tls&sni=${CF_DOMAIN}&fp=chrome&alpn=h2%2Chttp%2F1.1&type=ws&host=${CF_DOMAIN}&path=${ENC_PATH}&fragment=100-200,1-3,tlshello#${REMARK}-FastFrag-2"
+            # Fragment 10-25 bytes slices "trycloudflare.com" (17 chars) in half, 2-4ms delay keeps it fast!
+            # ALPN is strictly http/1.1 (Required for Cloudflare WebSocket)
+            LINK_1="vless://${UUID}@www.speedtest.net:443?encryption=none&security=tls&sni=${CF_DOMAIN}&fp=chrome&alpn=http%2F1.1&type=ws&host=${CF_DOMAIN}&path=${ENC_PATH}&fragment=10-25,2-4,tlshello#${REMARK}-Frag-Speedtest"
+            LINK_2="vless://${UUID}@162.159.135.42:443?encryption=none&security=tls&sni=${CF_DOMAIN}&fp=chrome&alpn=http%2F1.1&type=ws&host=${CF_DOMAIN}&path=${ENC_PATH}&fragment=10-25,2-4,tlshello#${REMARK}-Frag-IP1"
+            LINK_3="vless://${UUID}@104.18.2.161:443?encryption=none&security=tls&sni=${CF_DOMAIN}&fp=chrome&alpn=http%2F1.1&type=ws&host=${CF_DOMAIN}&path=${ENC_PATH}&fragment=10-25,2-4,tlshello#${REMARK}-Frag-IP2"
 
-            # 3. Full JSON Config with Built-in Mux + Fast Fragment + QUIC Block (Best for YouTube & Telegram)
-            cat > "$HOME/client-turbo.json" <<EOF
+            cat > "$HOME/client-fixed.json" <<EOF
           {
-            "remarks": "${REMARK}-Turbo-JSON",
+            "remarks": "${REMARK}-JSON-Fixed",
             "log": { "loglevel": "warning" },
             "dns": {
-              "servers": [
-                "https://1.1.1.1/dns-query",
-                "8.8.8.8"
-              ]
+              "servers": ["1.1.1.1", "8.8.8.8"],
+              "queryStrategy": "UseIPv4"
             },
             "inbounds": [
               {
@@ -197,7 +178,7 @@ jobs:
                 "settings": {
                   "vnext": [
                     {
-                      "address": "${CLEAN_IP}",
+                      "address": "www.speedtest.net",
                       "port": 443,
                       "users": [
                         { "id": "${UUID}", "encryption": "none" }
@@ -210,7 +191,7 @@ jobs:
                   "security": "tls",
                   "tlsSettings": {
                     "serverName": "${CF_DOMAIN}",
-                    "alpn": ["h2", "http/1.1"],
+                    "alpn": ["http/1.1"],
                     "fingerprint": "chrome"
                   },
                   "wsSettings": {
@@ -226,7 +207,7 @@ jobs:
                 "mux": {
                   "enabled": true,
                   "concurrency": 8,
-                  "xudpConcurrency": 16,
+                  "xudpConcurrency": 8,
                   "xudpProxyUDP443": "reject"
                 }
               },
@@ -237,8 +218,8 @@ jobs:
                   "domainStrategy": "AsIs",
                   "fragment": {
                     "packets": "tlshello",
-                    "length": "100-200",
-                    "interval": "1-3"
+                    "length": "10-25",
+                    "interval": "2-4"
                   }
                 }
               },
@@ -257,33 +238,31 @@ jobs:
 
             echo ""
             echo "=================================================================="
-            echo "  >>> 🚀 TURBO CONFIGS ARE READY! <<<"
+            echo "  >>> 🚀 FIXED CONFIGS ARE READY! <<<"
             echo ""
-            echo "  [Option 1] Copy the FULL JSON from the 'Summary' page of this Action!"
-            echo "             (It has Mux + Fast Fragment + YouTube QUIC Fix built-in)"
+            echo "  [1] Fragment + Speedtest (The one that gave you good ping, now fixed!):"
+            echo "$LINK_1"
             echo ""
-            echo "  [Option 2] Standard VLESS Links (If using these, TURN ON 'Mux' in your app!):"
+            echo "  [2] Fragment + Clean IP 1 (162.159.135.42):"
+            echo "$LINK_2"
             echo ""
-            echo "$LINK_FRAG_1"
-            echo ""
-            echo "$LINK_FRAG_2"
+            echo "  [3] Fragment + Clean IP 2 (104.18.2.161):"
+            echo "$LINK_3"
             echo "=================================================================="
 
             {
-              echo "### 🚀 ۱. کانفیگ طلایی JSON (مخصوص باز کردن سریع یوتیوب و تلگرام)"
-              echo "کل متن داخل کادر زیر را کپی کنید و در برنامه **v2rayNG / MahsaNG / v2rayN** گزینه **Import config from Clipboard (افزودن از کلیپ‌بورد)** را بزنید. در این کانفیگ قابلیت **Mux + Fast Fragment + ضد قفل یوتیوب** به صورت خودکار فعال است:"
-              echo '```json'
-              cat "$HOME/client-turbo.json"
+              echo "### 🔗 ۱. لینک‌های آماده با فرگمنت اصلاح‌شده (کپی و ایمپورت کنید)"
+              echo "هر ۳ لینک زیر را در برنامه خود وارد کنید و از هر کدام که پینگ بهتری داد استفاده کنید:"
+              echo '```'
+              echo "$LINK_1"
+              echo "$LINK_2"
+              echo "$LINK_3"
               echo '```'
               echo "---"
-              echo "### 🔗 ۲. لینک‌های معمولی VLESS (حتماً در تنظیمات برنامه Mux را روشن کنید)"
-              echo "**لینک اول (آی‌پی `${CLEAN_IP}`):**"
-              echo '```'
-              echo "$LINK_FRAG_1"
-              echo '```'
-              echo "**لینک دوم (آی‌پی پشتیبان `104.18.2.161`):**"
-              echo '```'
-              echo "$LINK_FRAG_2"
+              echo "### 🚀 ۲. کانفیگ کامل JSON (شامل فرگمنت `10-25` + Mux داخلی)"
+              echo "اگر از **v2rayNG / MahsaNG / v2rayN** استفاده می‌کنید، کل کد زیر را کپی و از کلیپ‌بورد ایمپورت کنید:"
+              echo '```json'
+              cat "$HOME/client-fixed.json"
               echo '```'
             } >> "$GITHUB_STEP_SUMMARY"
           }
@@ -292,13 +271,13 @@ jobs:
             echo ""
             echo "=================== SPEED TEST ==================="
             sleep 5
-            xray run -config "$HOME/client-turbo.json" >/dev/null 2>&1 &
+            xray run -config "$HOME/client-fixed.json" >/dev/null 2>&1 &
             local PID_T=$!
             sleep 3
             local T SPEED
             T=$(curl -s -o /dev/null --max-time 15 -x "socks5h://127.0.0.1:10808" -w '%{time_total}' "$TEST_URL_SMALL")
             SPEED=$(curl -sL -o /dev/null --max-time 15 -x "socks5h://127.0.0.1:10808" -w '%{speed_download}' "$TEST_URL_BIG")
-            printf '  Turbo JSON Tunnel -> latency: %s s | download: %s Mbps\n' "$T" "$(awk -v s="${SPEED:-0}" 'BEGIN { printf "%.1f", s * 8 / 1000000 }')"
+            printf '  Tunnel Self-Test -> latency: %s s | download: %s Mbps\n' "$T" "$(awk -v s="${SPEED:-0}" 'BEGIN { printf "%.1f", s * 8 / 1000000 }')"
             kill "$PID_T" 2>/dev/null; wait "$PID_T" 2>/dev/null
             echo "==================================================="
           }
@@ -319,7 +298,6 @@ jobs:
             TICK=$((TICK + 1))
             if ! kill -0 "$XRAY_PID" 2>/dev/null; then start_xray; fi
             if ! kill -0 "$CF_PID" 2>/dev/null; then
-              echo "Tunnel dropped! Reconnecting..."
               if start_cf; then announce; fi
             fi
             if [ $((TICK % 6)) -eq 0 ]; then
