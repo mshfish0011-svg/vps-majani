@@ -15,6 +15,13 @@ on:
         description: "Reality camouflage site (must support TLS 1.3 + h2), e.g. dl.google.com / www.speedtest.net / www.samsung.com"
         required: false
         default: "dl.google.com"
+      tunnel:
+        description: "Relay: bore (no time limit, auto-reconnect on the same port) or pinggy (experimental, 60-min sessions, link changes each hour)"
+        type: choice
+        options:
+          - bore
+          - pinggy
+        default: bore
 
 permissions:
   contents: read
@@ -31,6 +38,7 @@ jobs:
       HOURS: ${{ inputs.hours }}
       REMARK: ${{ inputs.remark }}
       SNI: ${{ inputs.sni }}
+      TUNNEL: ${{ inputs.tunnel }}
       XRAY_PORT: "10808"
 
     steps:
@@ -52,7 +60,18 @@ jobs:
           ./xray version | head -1
           ./bore --version
 
-      - name: 2. Generate Reality keys & Xray config
+      - name: 2. Network tuning (BBR + bigger buffers)
+        continue-on-error: true
+        run: |
+          sudo modprobe tcp_bbr 2>/dev/null || true
+          sudo sysctl -w net.core.default_qdisc=fq || true
+          sudo sysctl -w net.ipv4.tcp_congestion_control=bbr || true
+          sudo sysctl -w net.core.rmem_max=16777216 net.core.wmem_max=16777216 || true
+          sudo sysctl -w net.ipv4.tcp_rmem="4096 262144 16777216" net.ipv4.tcp_wmem="4096 262144 16777216" || true
+          echo "Congestion control now: $(sysctl -n net.ipv4.tcp_congestion_control)"
+          exit 0
+
+      - name: 3. Generate Reality keys & Xray config
         run: |
           set -e
           UUID=$(cat /proc/sys/kernel/random/uuid)
@@ -110,73 +129,147 @@ jobs:
 
           xray run -test -config "$HOME/xray.json"
 
-      - name: 3. Start tunnel, print config & keep alive
+      - name: 4. Start tunnel, print config & keep alive (auto-reconnect)
         run: |
-          # Start Xray
-          setsid nohup xray run -config "$HOME/xray.json" > "$HOME/xray.log" 2>&1 &
-          XRAY_PID=$!
+          set +e
+          ulimit -n 65535 2>/dev/null
+
+          LOG="$HOME/tunnel.log"
+          XRAY_PID=""; TUN_PID=""; REMOTE_HOST=""; REMOTE_PORT=""; LINK=""
+
+          start_xray() {
+            setsid nohup xray run -config "$HOME/xray.json" > "$HOME/xray.log" 2>&1 &
+            XRAY_PID=$!
+          }
+
+          # bore: raw TCP relay. $1 = wanted remote port (0 = random)
+          start_bore() {
+            : > "$LOG"
+            RUST_LOG=info setsid nohup bore local "$XRAY_PORT" --local-host 127.0.0.1 --to bore.pub --port "${1:-0}" > "$LOG" 2>&1 &
+            TUN_PID=$!
+            for _ in $(seq 1 20); do
+              R=$(grep -oE 'bore\.pub:[0-9]+' "$LOG" | head -1)
+              if [ -n "$R" ]; then REMOTE_HOST="bore.pub"; REMOTE_PORT="${R#bore.pub:}"; return 0; fi
+              kill -0 "$TUN_PID" 2>/dev/null || return 1
+              sleep 1
+            done
+            kill "$TUN_PID" 2>/dev/null
+            return 1
+          }
+
+          # pinggy: SSH based TCP relay (free sessions last 60 minutes, then the port changes)
+          start_pinggy() {
+            : > "$LOG"
+            setsid nohup ssh -p 443 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+              -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes \
+              -R0:127.0.0.1:"$XRAY_PORT" tcp@a.pinggy.io > "$LOG" 2>&1 < /dev/null &
+            TUN_PID=$!
+            for _ in $(seq 1 30); do
+              R=$(grep -oE 'tcp://[A-Za-z0-9.-]+:[0-9]+' "$LOG" | head -1)
+              if [ -n "$R" ]; then R="${R#tcp://}"; REMOTE_HOST="${R%:*}"; REMOTE_PORT="${R##*:}"; return 0; fi
+              kill -0 "$TUN_PID" 2>/dev/null || return 1
+              sleep 1
+            done
+            kill "$TUN_PID" 2>/dev/null
+            return 1
+          }
+
+          start_tunnel() {
+            if [ "$TUNNEL" = "pinggy" ]; then start_pinggy; else start_bore "${1:-0}"; fi
+          }
+
+          announce() {
+            # Use the raw IP in the link (no DNS name for filters to match on)
+            IP=$(getent ahostsv4 "$REMOTE_HOST" 2>/dev/null | awk '{print $1; exit}')
+            [ -z "$IP" ] && IP="$REMOTE_HOST"
+
+            LINK="vless://${UUID}@${IP}:${REMOTE_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUB}&sid=${SID}&type=tcp&headerType=none#${REMARK}"
+
+            # Self-test: an unauthenticated TLS handshake through the tunnel should return the real certificate of $SNI
+            echo "Self-test through the public tunnel..."
+            CERT=$(timeout 20 openssl s_client -connect "${IP}:${REMOTE_PORT}" -servername "$SNI" </dev/null 2>/dev/null | grep -i 'subject=' | head -1)
+            if [ -n "$CERT" ]; then echo "Self-test OK -> $CERT"; else echo "Self-test: no certificate returned (check the logs if the config does not work)"; fi
+
+            echo ""
+            echo "=================================================="
+            echo "  >>> VLESS + REALITY CONFIG IS READY! <<<"
+            echo ""
+            echo "$LINK"
+            echo ""
+            echo "  Server : ${IP}:${REMOTE_PORT}   (relay: $TUNNEL)"
+            echo "  Import the link from clipboard in v2rayN / v2rayNG / Hiddify / Streisand."
+            echo "=================================================="
+
+            {
+              echo "### 🚀 VLESS + Reality config ($(date +%H:%M) UTC)"
+              echo ""
+              echo '```'
+              echo "$LINK"
+              echo '```'
+              echo ""
+              echo "Server: \`${IP}:${REMOTE_PORT}\` · Relay: \`$TUNNEL\` · Camouflage SNI: \`${SNI}\`"
+              echo ""
+            } >> "$GITHUB_STEP_SUMMARY"
+          }
+
+          # ---- first start ----
+          start_xray
           sleep 2
 
-          # Start bore: exposes the local Xray port as a raw TCP port on bore.pub
-          RUST_LOG=info setsid nohup bore local "$XRAY_PORT" --local-host 127.0.0.1 --to bore.pub > "$HOME/bore.log" 2>&1 &
-          BORE_PID=$!
-
-          # Wait for the public port
-          REMOTE=""
-          for i in $(seq 1 30); do
-            REMOTE=$(grep -oE 'bore\.pub:[0-9]+' "$HOME/bore.log" | head -1 || true)
-            [ -n "$REMOTE" ] && break
-            sleep 2
+          OK=0
+          for t in 1 2 3 4 5; do
+            if start_tunnel 0; then OK=1; break; fi
+            echo "Tunnel start attempt $t failed:"; tail -5 "$LOG"; sleep 5
           done
-          if [ -z "$REMOTE" ]; then
-            echo "bore did not start. Log:"; cat "$HOME/bore.log"; exit 1
-          fi
-          PORT="${REMOTE#bore.pub:}"
+          if [ "$OK" -eq 0 ]; then echo "Could not start the tunnel."; exit 1; fi
+          announce
 
-          # Use the raw IP in the link (no DNS name for filters to match on)
-          IP=$(getent ahostsv4 bore.pub | awk '{print $1; exit}')
-          [ -z "$IP" ] && IP="bore.pub"
-
-          LINK="vless://${UUID}@${IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUB}&sid=${SID}&type=tcp&headerType=none#${REMARK}"
-
-          # Self-test: an unauthenticated TLS handshake through the tunnel should return the real certificate of $SNI
-          echo "Self-test through the public tunnel..."
-          CERT=$(timeout 20 openssl s_client -connect "${IP}:${PORT}" -servername "$SNI" </dev/null 2>/dev/null | grep -i 'subject=' | head -1 || true)
-          if [ -n "$CERT" ]; then echo "Self-test OK -> $CERT"; else echo "Self-test: no certificate returned (tunnel may still work, check the logs below if it doesn't)"; fi
-
-          echo ""
-          echo "=================================================="
-          echo "  >>> VLESS + REALITY CONFIG IS READY! <<<"
-          echo ""
-          echo "$LINK"
-          echo ""
-          echo "  Server : ${IP}:${PORT}"
-          echo "  Import the link from clipboard in v2rayN / v2rayNG / Hiddify / Streisand."
-          echo "=================================================="
-
-          {
-            echo "### 🚀 VLESS + Reality config is ready"
-            echo ""
-            echo '```'
-            echo "$LINK"
-            echo '```'
-            echo ""
-            echo "Server: \`${IP}:${PORT}\` · Camouflage SNI: \`${SNI}\`"
-            echo ""
-            echo "The link changes on every run."
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          # Keep alive (stay under GitHub's 360-minute job limit)
+          # ---- keep alive (stay under GitHub's 360-minute job limit) ----
           MINUTES=$(awk -v h="$HOURS" 'BEGIN { m = h * 60; if (m > 340) m = 340; printf "%d", m }')
           END=$(( $(date +%s) + MINUTES * 60 ))
           echo "Tunnel stays up for ~${MINUTES} minutes. Cancel the run to stop earlier."
 
-          i=0
+          TICK=0
           while [ "$(date +%s)" -lt "$END" ]; do
-            sleep 60
-            i=$((i + 1))
-            if ! kill -0 "$XRAY_PID" 2>/dev/null; then echo "Xray died:"; tail -20 "$HOME/xray.log"; exit 1; fi
-            if ! kill -0 "$BORE_PID" 2>/dev/null; then echo "bore died (the link is no longer valid):"; tail -20 "$HOME/bore.log"; exit 1; fi
-            echo "[$i] Tunnel running... ~$(( (END - $(date +%s)) / 60 )) min left"
+            sleep 10
+            TICK=$((TICK + 1))
+
+            # Xray died -> restart it
+            if ! kill -0 "$XRAY_PID" 2>/dev/null; then
+              echo "Xray died, restarting. Last log lines:"; tail -5 "$HOME/xray.log"
+              start_xray
+            fi
+
+            # Tunnel died -> reconnect (bore: same port, so your existing link keeps working)
+            if ! kill -0 "$TUN_PID" 2>/dev/null; then
+              echo "Tunnel dropped at $(date +%T). Last log lines:"; tail -5 "$LOG"
+              OLD_PORT="$REMOTE_PORT"; OK=0
+
+              if [ "$TUNNEL" = "bore" ]; then
+                for t in 1 2 3 4 5; do
+                  sleep 3
+                  if start_bore "$OLD_PORT"; then OK=1; break; fi
+                done
+              fi
+              if [ "$OK" -eq 0 ]; then
+                for t in 1 2 3 4 5; do
+                  if start_tunnel 0; then OK=1; break; fi
+                  sleep 5
+                done
+              fi
+              if [ "$OK" -eq 0 ]; then echo "Could not reconnect the tunnel."; exit 1; fi
+
+              if [ "$TUNNEL" = "bore" ] && [ "$REMOTE_PORT" = "$OLD_PORT" ]; then
+                echo "Reconnected on the SAME port -> your current link still works."
+              else
+                echo "The port changed -> import the NEW link below:"
+                announce
+              fi
+            fi
+
+            if [ $((TICK % 6)) -eq 0 ]; then
+              echo "[$((TICK / 6))] Tunnel running... ~$(( (END - $(date +%s)) / 60 )) min left"
+            fi
           done
           echo "Time is up, shutting down."
+          exit 0
