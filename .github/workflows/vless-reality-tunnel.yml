@@ -1,4 +1,4 @@
-name: High-Speed VLESS Tunnel (Cloudflare + Reality Backup)
+name: VLESS Cloudflare Turbo (Fast Fragment + Mux + YouTube Fix)
 on:
   workflow_dispatch:
     inputs:
@@ -9,21 +9,17 @@ on:
       remark:
         description: "Name of the config in your client app (no spaces)"
         required: false
-        default: "GitHub"
+        default: "GitHub-Turbo"
       clean_ip:
-        description: "Clean Cloudflare IP or Domain for WS config"
+        description: "Clean Cloudflare IP (e.g. 162.159.135.42 / 104.18.2.161 / www.visa.com.sg)"
         required: false
-        default: "www.speedtest.net"
-      sni:
-        description: "Reality camouflage site (for Bore backup tunnel)"
-        required: false
-        default: "dl.google.com"
+        default: "162.159.135.42"
 
 permissions:
   contents: read
 
 concurrency:
-  group: vless-hybrid-tunnel
+  group: vless-turbo-tunnel
   cancel-in-progress: true
 
 jobs:
@@ -34,66 +30,46 @@ jobs:
       HOURS: ${{ inputs.hours }}
       REMARK: ${{ inputs.remark }}
       CLEAN_IP: ${{ inputs.clean_ip }}
-      SNI: ${{ inputs.sni }}
-      PORT_REALITY: "10808"
       PORT_WS: "10809"
-      WS_PATH: "/vless-ws"
+      WS_PATH: "/ws"
       TEST_URL_SMALL: "https://www.google.com/generate_204"
-      TEST_URL_BIG: "https://speed.cloudflare.com/__down?bytes=30000000"
+      TEST_URL_BIG: "https://speed.cloudflare.com/__down?bytes=25000000"
 
     steps:
-      - name: 1. Install Xray, Cloudflared & Bore
+      - name: 1. Install Xray & Cloudflared
         run: |
           set -e
           mkdir -p "$HOME/bin" && cd "$HOME/bin"
-          
-          # 1. Install Xray
           curl -fsSL --retry 3 -o xray.zip https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
           unzip -qo xray.zip
-          
-          # 2. Install Cloudflared (Primary High-Speed Tunnel)
           curl -fsSL --retry 3 -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
-          
-          # 3. Install Bore (Backup Raw-TCP Tunnel)
-          TAG=$(curl -fsSIL -o /dev/null -w '%{url_effective}' https://github.com/ekzhang/bore/releases/latest | sed 's#.*/tag/##')
-          curl -fsSL --retry 3 -o bore.tgz "https://github.com/ekzhang/bore/releases/download/${TAG}/bore-${TAG}-x86_64-unknown-linux-musl.tar.gz"
-          tar xzf bore.tgz
-          
-          chmod +x xray cloudflared bore
+          chmod +x xray cloudflared
           echo "$HOME/bin" >> "$GITHUB_PATH"
           ./xray version | head -1
           ./cloudflared --version
-          ./bore --version
 
-      - name: 2. Network tuning (BBR + bigger buffers)
+      - name: 2. Network Tuning (BBR + Low Latency)
         continue-on-error: true
         run: |
           sudo modprobe tcp_bbr 2>/dev/null || true
           sudo sysctl -w net.core.default_qdisc=fq || true
           sudo sysctl -w net.ipv4.tcp_congestion_control=bbr || true
           sudo sysctl -w net.core.rmem_max=16777216 net.core.wmem_max=16777216 || true
-          sudo sysctl -w net.ipv4.tcp_rmem="4096 262144 16777216" net.ipv4.tcp_wmem="4096 262144 16777216" || true
-          echo "Congestion control now: $(sysctl -n net.ipv4.tcp_congestion_control)"
+          sudo sysctl -w net.ipv4.tcp_fastopen=3 || true
           exit 0
 
-      - name: 3. Generate Keys & Dual-Inbound Xray Config
+      - name: 3. Configure Xray (DNS + QUIC Block for YouTube)
         run: |
           set -e
           UUID=$(cat /proc/sys/kernel/random/uuid)
-          SID=$(head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n')
-          KEYS=$(xray x25519)
-          PRIV=$(echo "$KEYS" | sed -n '1p' | awk '{print $NF}')
-          PUB=$(echo "$KEYS"  | sed -n '2p' | awk '{print $NF}')
-          
-          {
-            echo "UUID=$UUID"
-            echo "SID=$SID"
-            echo "PUB=$PUB"
-          } >> "$GITHUB_ENV"
+          echo "UUID=$UUID" >> "$GITHUB_ENV"
 
           cat > "$HOME/xray.json" <<EOF
           {
             "log": { "loglevel": "warning" },
+            "dns": {
+              "servers": ["1.1.1.1", "8.8.8.8", "localhost"]
+            },
             "inbounds": [
               {
                 "tag": "in-ws",
@@ -109,54 +85,54 @@ jobs:
                   "security": "none",
                   "wsSettings": { "path": "$WS_PATH" }
                 },
-                "sniffing": { "enabled": true, "destOverride": ["http", "tls"], "routeOnly": true }
-              },
-              {
-                "tag": "in-reality",
-                "listen": "127.0.0.1",
-                "port": $PORT_REALITY,
-                "protocol": "vless",
-                "settings": {
-                  "clients": [{ "id": "$UUID", "flow": "xtls-rprx-vision" }],
-                  "decryption": "none"
-                },
-                "streamSettings": {
-                  "network": "tcp",
-                  "security": "reality",
-                  "realitySettings": {
-                    "show": false,
-                    "dest": "$SNI:443",
-                    "xver": 0,
-                    "serverNames": ["$SNI"],
-                    "privateKey": "$PRIV",
-                    "shortIds": ["$SID"]
-                  }
-                },
-                "sniffing": { "enabled": true, "destOverride": ["http", "tls"], "routeOnly": true }
+                "sniffing": {
+                  "enabled": true,
+                  "destOverride": ["http", "tls", "quic"]
+                }
               }
             ],
             "outbounds": [
-              { "protocol": "freedom", "tag": "direct", "settings": { "domainStrategy": "UseIPv4" } },
-              { "protocol": "blackhole", "tag": "block" }
+              {
+                "protocol": "freedom",
+                "tag": "direct",
+                "settings": { "domainStrategy": "UseIPv4" }
+              },
+              {
+                "protocol": "blackhole",
+                "tag": "block"
+              }
             ],
             "routing": {
+              "domainStrategy": "IPIfNonMatch",
               "rules": [
-                { "type": "field", "protocol": ["bittorrent"], "outboundTag": "block" },
-                { "type": "field", "ip": ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16"], "outboundTag": "block" }
+                {
+                  "type": "field",
+                  "network": "udp",
+                  "port": "443",
+                  "outboundTag": "block"
+                },
+                {
+                  "type": "field",
+                  "protocol": ["bittorrent"],
+                  "outboundTag": "block"
+                },
+                {
+                  "type": "field",
+                  "ip": ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16"],
+                  "outboundTag": "block"
+                }
               ]
             }
           }
           EOF
           xray run -test -config "$HOME/xray.json"
 
-      - name: 4. Start Tunnels, Speed Test, Print Configs & Keep Alive
+      - name: 4. Start Tunnel, Generate Turbo Configs & Keep Alive
         run: |
           set +e
           ulimit -n 65535 2>/dev/null
           CF_LOG="$HOME/cf.log"
-          BORE_LOG="$HOME/bore.log"
-          XRAY_PID=""; CF_PID=""; BORE_PID=""
-          CF_DOMAIN=""; BORE_PORT=""; BORE_IP=""
+          XRAY_PID=""; CF_PID=""; CF_DOMAIN=""
 
           start_xray() {
             setsid nohup xray run -config "$HOME/xray.json" > "$HOME/xray.log" 2>&1 &
@@ -177,162 +153,177 @@ jobs:
             return 1
           }
 
-          start_bore() {
-            : > "$BORE_LOG"
-            RUST_LOG=info setsid nohup bore local "$PORT_REALITY" --local-host 127.0.0.1 --to bore.pub --port "${1:-0}" > "$BORE_LOG" 2>&1 &
-            BORE_PID=$!
-            for _ in $(seq 1 20); do
-              R=$(grep -oE 'bore\.pub:[0-9]+' "$BORE_LOG" | head -1)
-              if [ -n "$R" ]; then
-                BORE_PORT="${R#bore.pub:}"
-                BORE_IP=$(getent ahostsv4 "bore.pub" 2>/dev/null | awk '{print $1; exit}')
-                [ -z "$BORE_IP" ] && BORE_IP="bore.pub"
-                return 0
-              fi
-              kill -0 "$BORE_PID" 2>/dev/null || return 1
-              sleep 1
-            done
-            kill "$BORE_PID" 2>/dev/null
-            return 1
-          }
-
           announce() {
             ENC_PATH=$(echo "$WS_PATH" | sed 's#/#%2F#g')
-            LINK_CF_CLEAN="vless://${UUID}@${CLEAN_IP}:443?encryption=none&security=tls&sni=${CF_DOMAIN}&fp=chrome&alpn=http%2F1.1&type=ws&host=${CF_DOMAIN}&path=${ENC_PATH}#${REMARK}-CF-Fast"
-            LINK_CF_FRAG="vless://${UUID}@${CLEAN_IP}:443?encryption=none&security=tls&sni=${CF_DOMAIN}&fp=chrome&alpn=http%2F1.1&type=ws&host=${CF_DOMAIN}&path=${ENC_PATH}&fragment=10-20,10-20,tlshello#${REMARK}-CF-Fragment"
-            LINK_REALITY="vless://${UUID}@${BORE_IP}:${BORE_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUB}&sid=${SID}&type=tcp&headerType=none#${REMARK}-Reality-Backup"
+            
+            # 1. Fast Fragment Link (100-200 bytes, 1-3ms delay, h2+http/1.1 ALPN)
+            LINK_FRAG_1="vless://${UUID}@${CLEAN_IP}:443?encryption=none&security=tls&sni=${CF_DOMAIN}&fp=chrome&alpn=h2%2Chttp%2F1.1&type=ws&host=${CF_DOMAIN}&path=${ENC_PATH}&fragment=100-200,1-3,tlshello#${REMARK}-FastFrag-1"
+            
+            # 2. Backup Clean IP Link (104.18.2.161)
+            LINK_FRAG_2="vless://${UUID}@104.18.2.161:443?encryption=none&security=tls&sni=${CF_DOMAIN}&fp=chrome&alpn=h2%2Chttp%2F1.1&type=ws&host=${CF_DOMAIN}&path=${ENC_PATH}&fragment=100-200,1-3,tlshello#${REMARK}-FastFrag-2"
+
+            # 3. Full JSON Config with Built-in Mux + Fast Fragment + QUIC Block (Best for YouTube & Telegram)
+            cat > "$HOME/client-turbo.json" <<EOF
+          {
+            "remarks": "${REMARK}-Turbo-JSON",
+            "log": { "loglevel": "warning" },
+            "dns": {
+              "servers": [
+                "https://1.1.1.1/dns-query",
+                "8.8.8.8"
+              ]
+            },
+            "inbounds": [
+              {
+                "tag": "socks",
+                "port": 10808,
+                "listen": "127.0.0.1",
+                "protocol": "socks",
+                "sniffing": { "enabled": true, "destOverride": ["http", "tls"], "routeOnly": false },
+                "settings": { "auth": "noauth", "udp": true }
+              },
+              {
+                "tag": "http",
+                "port": 10809,
+                "listen": "127.0.0.1",
+                "protocol": "http",
+                "sniffing": { "enabled": true, "destOverride": ["http", "tls"], "routeOnly": false }
+              }
+            ],
+            "outbounds": [
+              {
+                "tag": "proxy",
+                "protocol": "vless",
+                "settings": {
+                  "vnext": [
+                    {
+                      "address": "${CLEAN_IP}",
+                      "port": 443,
+                      "users": [
+                        { "id": "${UUID}", "encryption": "none" }
+                      ]
+                    }
+                  ]
+                },
+                "streamSettings": {
+                  "network": "ws",
+                  "security": "tls",
+                  "tlsSettings": {
+                    "serverName": "${CF_DOMAIN}",
+                    "alpn": ["h2", "http/1.1"],
+                    "fingerprint": "chrome"
+                  },
+                  "wsSettings": {
+                    "path": "${WS_PATH}",
+                    "headers": { "Host": "${CF_DOMAIN}" }
+                  },
+                  "sockopt": {
+                    "dialerProxy": "fragment",
+                    "tcpKeepAliveIdle": 100,
+                    "tcpNoDelay": true
+                  }
+                },
+                "mux": {
+                  "enabled": true,
+                  "concurrency": 8,
+                  "xudpConcurrency": 16,
+                  "xudpProxyUDP443": "reject"
+                }
+              },
+              {
+                "tag": "fragment",
+                "protocol": "freedom",
+                "settings": {
+                  "domainStrategy": "AsIs",
+                  "fragment": {
+                    "packets": "tlshello",
+                    "length": "100-200",
+                    "interval": "1-3"
+                  }
+                }
+              },
+              { "tag": "direct", "protocol": "freedom" },
+              { "tag": "block", "protocol": "blackhole" }
+            ],
+            "routing": {
+              "domainStrategy": "IPIfNonMatch",
+              "rules": [
+                { "type": "field", "network": "udp", "port": "443", "outboundTag": "block" },
+                { "type": "field", "ip": ["geoip:private"], "outboundTag": "direct" }
+              ]
+            }
+          }
+          EOF
 
             echo ""
             echo "=================================================================="
-            echo "  >>> 🚀 CONFIGS ARE READY! <<<"
+            echo "  >>> 🚀 TURBO CONFIGS ARE READY! <<<"
             echo ""
-            if [ -n "$CF_DOMAIN" ]; then
-              echo "  [1] 🌟 Cloudflare High-Speed (Clean IP) - RECOMMENDED:"
-              echo "$LINK_CF_CLEAN"
-              echo ""
-              echo "  [2] 🛡️ Cloudflare + TLS Fragment (Use if [1] fails on your ISP):"
-              echo "$LINK_CF_FRAG"
-              echo ""
-            fi
-            if [ -n "$BORE_PORT" ]; then
-              echo "  [3] 🔄 Reality Backup (bore.pub:${BORE_PORT}):"
-              echo "$LINK_REALITY"
-              echo ""
-            fi
-            echo "  Tip: If using v2rayNG / Hiddify / MahsaNG, enable 'Mux' or 'Fragment'"
-            echo "  in your app settings for maximum stability."
+            echo "  [Option 1] Copy the FULL JSON from the 'Summary' page of this Action!"
+            echo "             (It has Mux + Fast Fragment + YouTube QUIC Fix built-in)"
+            echo ""
+            echo "  [Option 2] Standard VLESS Links (If using these, TURN ON 'Mux' in your app!):"
+            echo ""
+            echo "$LINK_FRAG_1"
+            echo ""
+            echo "$LINK_FRAG_2"
             echo "=================================================================="
 
             {
-              echo "### 🚀 Configs ($(date +%H:%M) UTC)"
-              if [ -n "$CF_DOMAIN" ]; then
-                echo "#### 1. 🌟 Cloudflare High-Speed (Clean IP - Recommended)"
-                echo '```'
-                echo "$LINK_CF_CLEAN"
-                echo '```'
-                echo "#### 2. 🛡️ Cloudflare + Fragment (For strict ISPs)"
-                echo '```'
-                echo "$LINK_CF_FRAG"
-                echo '```'
-              fi
-              if [ -n "$BORE_PORT" ]; then
-                echo "#### 3. 🔄 Reality Backup (\`${BORE_IP}:${BORE_PORT}\`)"
-                echo '```'
-                echo "$LINK_REALITY"
-                echo '```'
-              fi
+              echo "### 🚀 ۱. کانفیگ طلایی JSON (مخصوص باز کردن سریع یوتیوب و تلگرام)"
+              echo "کل متن داخل کادر زیر را کپی کنید و در برنامه **v2rayNG / MahsaNG / v2rayN** گزینه **Import config from Clipboard (افزودن از کلیپ‌بورد)** را بزنید. در این کانفیگ قابلیت **Mux + Fast Fragment + ضد قفل یوتیوب** به صورت خودکار فعال است:"
+              echo '```json'
+              cat "$HOME/client-turbo.json"
+              echo '```'
+              echo "---"
+              echo "### 🔗 ۲. لینک‌های معمولی VLESS (حتماً در تنظیمات برنامه Mux را روشن کنید)"
+              echo "**لینک اول (آی‌پی `${CLEAN_IP}`):**"
+              echo '```'
+              echo "$LINK_FRAG_1"
+              echo '```'
+              echo "**لینک دوم (آی‌پی پشتیبان `104.18.2.161`):**"
+              echo '```'
+              echo "$LINK_FRAG_2"
+              echo '```'
             } >> "$GITHUB_STEP_SUMMARY"
           }
 
           speed_test() {
             echo ""
             echo "=================== SPEED TEST ==================="
-            local D
-            D=$(curl -sL -o /dev/null --max-time 15 -w '%{speed_download}' "$TEST_URL_BIG")
-            printf '  %-22s download: %s Mbps\n' "Direct Runner" "$(awk -v s="${D:-0}" 'BEGIN { printf "%.1f", s * 8 / 1000000 }')"
-
-            # Test Cloudflare Tunnel
-            if [ -n "$CF_DOMAIN" ]; then
-              sleep 5 # Wait for DNS propagation
-              cat > "$HOME/test-cf.json" <<EOF
-              {"log":{"loglevel":"none"},"inbounds":[{"listen":"127.0.0.1","port":10810,"protocol":"socks"}],"outbounds":[{"protocol":"vless","settings":{"vnext":[{"address":"$CLEAN_IP","port":443,"users":[{"id":"$UUID","encryption":"none"}]}]},"streamSettings":{"network":"ws","security":"tls","tlsSettings":{"serverName":"$CF_DOMAIN","fingerprint":"chrome"},"wsSettings":{"path":"$WS_PATH","headers":{"Host":"$CF_DOMAIN"}}}}]}
-          EOF
-              xray run -config "$HOME/test-cf.json" >/dev/null 2>&1 &
-              local PID_T=$!
-              sleep 3
-              local T SPEED
-              T=$(curl -s -o /dev/null --max-time 15 -x "socks5h://127.0.0.1:10810" -w '%{time_total}' "$TEST_URL_SMALL")
-              SPEED=$(curl -sL -o /dev/null --max-time 15 -x "socks5h://127.0.0.1:10810" -w '%{speed_download}' "$TEST_URL_BIG")
-              printf '  %-22s latency: %s s | download: %s Mbps\n' "1. Cloudflare WS" "$T" "$(awk -v s="${SPEED:-0}" 'BEGIN { printf "%.1f", s * 8 / 1000000 }')"
-              kill "$PID_T" 2>/dev/null; wait "$PID_T" 2>/dev/null
-            fi
-
-            # Test Bore Reality Tunnel
-            if [ -n "$BORE_PORT" ]; then
-              cat > "$HOME/test-bore.json" <<EOF
-              {"log":{"loglevel":"none"},"inbounds":[{"listen":"127.0.0.1","port":10811,"protocol":"socks"}],"outbounds":[{"protocol":"vless","settings":{"vnext":[{"address":"$BORE_IP","port":$BORE_PORT,"users":[{"id":"$UUID","encryption":"none","flow":"xtls-rprx-vision"}]}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":"$SNI","fingerprint":"chrome","publicKey":"$PUB","shortId":"$SID"}}}]}
-          EOF
-              xray run -config "$HOME/test-bore.json" >/dev/null 2>&1 &
-              local PID_B=$!
-              sleep 3
-              local TB SPEEDB
-              TB=$(curl -s -o /dev/null --max-time 15 -x "socks5h://127.0.0.1:10811" -w '%{time_total}' "$TEST_URL_SMALL")
-              SPEEDB=$(curl -sL -o /dev/null --max-time 15 -x "socks5h://127.0.0.1:10811" -w '%{speed_download}' "$TEST_URL_BIG")
-              printf '  %-22s latency: %s s | download: %s Mbps\n' "2. Bore Reality" "$TB" "$(awk -v s="${SPEEDB:-0}" 'BEGIN { printf "%.1f", s * 8 / 1000000 }')"
-              kill "$PID_B" 2>/dev/null; wait "$PID_B" 2>/dev/null
-            fi
+            sleep 5
+            xray run -config "$HOME/client-turbo.json" >/dev/null 2>&1 &
+            local PID_T=$!
+            sleep 3
+            local T SPEED
+            T=$(curl -s -o /dev/null --max-time 15 -x "socks5h://127.0.0.1:10808" -w '%{time_total}' "$TEST_URL_SMALL")
+            SPEED=$(curl -sL -o /dev/null --max-time 15 -x "socks5h://127.0.0.1:10808" -w '%{speed_download}' "$TEST_URL_BIG")
+            printf '  Turbo JSON Tunnel -> latency: %s s | download: %s Mbps\n' "$T" "$(awk -v s="${SPEED:-0}" 'BEGIN { printf "%.1f", s * 8 / 1000000 }')"
+            kill "$PID_T" 2>/dev/null; wait "$PID_T" 2>/dev/null
             echo "==================================================="
-            echo ""
           }
 
-          # ---- Start Everything ----
           start_xray
           sleep 2
-
-          echo "Starting Cloudflare Tunnel..."
           for _ in 1 2 3; do start_cf && break; sleep 3; done
-
-          echo "Starting Bore Backup Tunnel..."
-          for _ in 1 2 3; do start_bore 0 && break; sleep 3; done
-
-          if [ -z "$CF_DOMAIN" ] && [ -z "$BORE_PORT" ]; then
-            echo "Both tunnels failed to start."
-            exit 1
-          fi
+          if [ -z "$CF_DOMAIN" ]; then echo "Failed to start Cloudflare tunnel."; exit 1; fi
 
           announce
           speed_test
 
-          # ---- Keep Alive Loop ----
           MINUTES=$(awk -v h="$HOURS" 'BEGIN { m = h * 60; if (m > 340) m = 340; printf "%d", m }')
           END=$(( $(date +%s) + MINUTES * 60 ))
-          echo "Tunnels stay up for ~${MINUTES} minutes."
           TICK=0
-
           while [ "$(date +%s)" -lt "$END" ]; do
             sleep 10
             TICK=$((TICK + 1))
-
-            if ! kill -0 "$XRAY_PID" 2>/dev/null; then
-              echo "Xray died, restarting..."
-              start_xray
-            fi
-
-            if [ -n "$CF_DOMAIN" ] && ! kill -0 "$CF_PID" 2>/dev/null; then
-              echo "Cloudflare tunnel dropped! Reconnecting..."
+            if ! kill -0 "$XRAY_PID" 2>/dev/null; then start_xray; fi
+            if ! kill -0 "$CF_PID" 2>/dev/null; then
+              echo "Tunnel dropped! Reconnecting..."
               if start_cf; then announce; fi
             fi
-
-            if [ -n "$BORE_PORT" ] && ! kill -0 "$BORE_PID" 2>/dev/null; then
-              echo "Bore tunnel dropped! Reconnecting..."
-              OLD_PORT="$BORE_PORT"
-              if ! start_bore "$OLD_PORT"; then start_bore 0; fi
-              if [ "$BORE_PORT" != "$OLD_PORT" ]; then announce; fi
-            fi
-
             if [ $((TICK % 6)) -eq 0 ]; then
-              echo "[$((TICK / 6))] Running smoothly... ~$(( (END - $(date +%s)) / 60 )) min left"
+              echo "[$((TICK / 6))] Running... ~$(( (END - $(date +%s)) / 60 )) min left"
             fi
           done
-          echo "Time is up, shutting down."
           exit 0
