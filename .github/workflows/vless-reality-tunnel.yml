@@ -1,0 +1,182 @@
+name: VLESS Reality Tunnel (Xray + bore, no Cloudflare)
+
+on:
+  workflow_dispatch:
+    inputs:
+      hours:
+        description: "How many hours to keep the tunnel alive (max ~5.6)"
+        required: false
+        default: "4"
+      remark:
+        description: "Name of the config in your client app (no spaces)"
+        required: false
+        default: "GitHub-Reality"
+      sni:
+        description: "Reality camouflage site (must support TLS 1.3 + h2), e.g. dl.google.com / www.speedtest.net / www.samsung.com"
+        required: false
+        default: "dl.google.com"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vless-reality-tunnel
+  cancel-in-progress: true
+
+jobs:
+  tunnel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      HOURS: ${{ inputs.hours }}
+      REMARK: ${{ inputs.remark }}
+      SNI: ${{ inputs.sni }}
+      XRAY_PORT: "10808"
+
+    steps:
+      - name: 1. Install Xray & bore
+        run: |
+          set -e
+          mkdir -p "$HOME/bin" && cd "$HOME/bin"
+
+          curl -fsSL --retry 3 -o xray.zip https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
+          unzip -qo xray.zip
+
+          # Resolve the latest bore tag via the redirect (avoids GitHub API rate limits)
+          TAG=$(curl -fsSIL -o /dev/null -w '%{url_effective}' https://github.com/ekzhang/bore/releases/latest | sed 's#.*/tag/##')
+          curl -fsSL --retry 3 -o bore.tgz "https://github.com/ekzhang/bore/releases/download/${TAG}/bore-${TAG}-x86_64-unknown-linux-musl.tar.gz"
+          tar xzf bore.tgz
+
+          chmod +x xray bore
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          ./xray version | head -1
+          ./bore --version
+
+      - name: 2. Generate Reality keys & Xray config
+        run: |
+          set -e
+          UUID=$(cat /proc/sys/kernel/random/uuid)
+          SID=$(head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n')
+
+          # Line 1 = private key, line 2 = public key (works with old and new Xray output formats)
+          KEYS=$(xray x25519)
+          PRIV=$(echo "$KEYS" | sed -n '1p' | awk '{print $NF}')
+          PUB=$(echo "$KEYS"  | sed -n '2p' | awk '{print $NF}')
+          if [ -z "$PRIV" ] || [ -z "$PUB" ]; then echo "Could not generate x25519 keys"; echo "$KEYS"; exit 1; fi
+
+          {
+            echo "UUID=$UUID"
+            echo "SID=$SID"
+            echo "PUB=$PUB"
+          } >> "$GITHUB_ENV"
+
+          cat > "$HOME/xray.json" <<EOF
+          {
+            "log": { "loglevel": "warning" },
+            "inbounds": [{
+              "listen": "127.0.0.1",
+              "port": $XRAY_PORT,
+              "protocol": "vless",
+              "settings": {
+                "clients": [{ "id": "$UUID", "flow": "xtls-rprx-vision" }],
+                "decryption": "none"
+              },
+              "streamSettings": {
+                "network": "tcp",
+                "security": "reality",
+                "realitySettings": {
+                  "show": false,
+                  "dest": "$SNI:443",
+                  "xver": 0,
+                  "serverNames": ["$SNI"],
+                  "privateKey": "$PRIV",
+                  "shortIds": ["$SID"]
+                }
+              },
+              "sniffing": { "enabled": true, "destOverride": ["http", "tls"] }
+            }],
+            "outbounds": [
+              { "protocol": "freedom", "tag": "direct" },
+              { "protocol": "blackhole", "tag": "block" }
+            ],
+            "routing": {
+              "rules": [
+                { "type": "field", "protocol": ["bittorrent"], "outboundTag": "block" },
+                { "type": "field", "ip": ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16"], "outboundTag": "block" }
+              ]
+            }
+          }
+          EOF
+
+          xray run -test -config "$HOME/xray.json"
+
+      - name: 3. Start tunnel, print config & keep alive
+        run: |
+          # Start Xray
+          setsid nohup xray run -config "$HOME/xray.json" > "$HOME/xray.log" 2>&1 &
+          XRAY_PID=$!
+          sleep 2
+
+          # Start bore: exposes the local Xray port as a raw TCP port on bore.pub
+          RUST_LOG=info setsid nohup bore local "$XRAY_PORT" --local-host 127.0.0.1 --to bore.pub > "$HOME/bore.log" 2>&1 &
+          BORE_PID=$!
+
+          # Wait for the public port
+          REMOTE=""
+          for i in $(seq 1 30); do
+            REMOTE=$(grep -oE 'bore\.pub:[0-9]+' "$HOME/bore.log" | head -1 || true)
+            [ -n "$REMOTE" ] && break
+            sleep 2
+          done
+          if [ -z "$REMOTE" ]; then
+            echo "bore did not start. Log:"; cat "$HOME/bore.log"; exit 1
+          fi
+          PORT="${REMOTE#bore.pub:}"
+
+          # Use the raw IP in the link (no DNS name for filters to match on)
+          IP=$(getent ahostsv4 bore.pub | awk '{print $1; exit}')
+          [ -z "$IP" ] && IP="bore.pub"
+
+          LINK="vless://${UUID}@${IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUB}&sid=${SID}&type=tcp&headerType=none#${REMARK}"
+
+          # Self-test: an unauthenticated TLS handshake through the tunnel should return the real certificate of $SNI
+          echo "Self-test through the public tunnel..."
+          CERT=$(timeout 20 openssl s_client -connect "${IP}:${PORT}" -servername "$SNI" </dev/null 2>/dev/null | grep -i 'subject=' | head -1 || true)
+          if [ -n "$CERT" ]; then echo "Self-test OK -> $CERT"; else echo "Self-test: no certificate returned (tunnel may still work, check the logs below if it doesn't)"; fi
+
+          echo ""
+          echo "=================================================="
+          echo "  >>> VLESS + REALITY CONFIG IS READY! <<<"
+          echo ""
+          echo "$LINK"
+          echo ""
+          echo "  Server : ${IP}:${PORT}"
+          echo "  Import the link from clipboard in v2rayN / v2rayNG / Hiddify / Streisand."
+          echo "=================================================="
+
+          {
+            echo "### 🚀 VLESS + Reality config is ready"
+            echo ""
+            echo '```'
+            echo "$LINK"
+            echo '```'
+            echo ""
+            echo "Server: \`${IP}:${PORT}\` · Camouflage SNI: \`${SNI}\`"
+            echo ""
+            echo "The link changes on every run."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Keep alive (stay under GitHub's 360-minute job limit)
+          MINUTES=$(awk -v h="$HOURS" 'BEGIN { m = h * 60; if (m > 340) m = 340; printf "%d", m }')
+          END=$(( $(date +%s) + MINUTES * 60 ))
+          echo "Tunnel stays up for ~${MINUTES} minutes. Cancel the run to stop earlier."
+
+          i=0
+          while [ "$(date +%s)" -lt "$END" ]; do
+            sleep 60
+            i=$((i + 1))
+            if ! kill -0 "$XRAY_PID" 2>/dev/null; then echo "Xray died:"; tail -20 "$HOME/xray.log"; exit 1; fi
+            if ! kill -0 "$BORE_PID" 2>/dev/null; then echo "bore died (the link is no longer valid):"; tail -20 "$HOME/bore.log"; exit 1; fi
+            echo "[$i] Tunnel running... ~$(( (END - $(date +%s)) / 60 )) min left"
+          done
+          echo "Time is up, shutting down."
