@@ -8,7 +8,7 @@ on:
         required: false
         default: "github-rdp-server"
       hours:
-        description: "How many hours to keep the server alive (GitHub hard limit is 6h, so max ~5.6)"
+        description: "How many hours to keep the server alive (max ~5.6)"
         required: false
         default: "5.5"
       idle_minutes:
@@ -16,18 +16,17 @@ on:
         required: false
         default: "0"
       timezone:
-        description: "Windows time zone ID (empty = keep default), e.g. Iran Standard Time"
+        description: "Windows time zone ID (e.g. Iran Standard Time)"
         required: false
-        default: ""
+        default: "Iran Standard Time"
       install_tools:
-        description: "Install extra tools (VS Code, Notepad++, 7-Zip, VLC)"
+        description: "Install extra tools (VS Code, Notepad++, VLC, OpenCode, QwenWork, Antigravity)"
         type: boolean
         default: true
 
 permissions:
   contents: read
 
-# A new run replaces the old one, so you never end up with two servers fighting over one hostname
 concurrency:
   group: windows-cloud-rdp
   cancel-in-progress: true
@@ -47,30 +46,59 @@ jobs:
       TZ_ID: ${{ inputs.timezone }}
 
     steps:
-      - name: 1. Enable Remote Desktop & Firewall
+      - name: 1. System Tuning & Enable RDP
         run: |
+          # --- System Specs ---
+          $cpu  = (Get-CimInstance Win32_Processor | Select-Object -First 1)
+          $ram  = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 1)
+          $disk = Get-PSDrive C
+          Write-Host "CPU  : $($cpu.Name) ($($cpu.NumberOfLogicalProcessors) logical cores)"
+          Write-Host "RAM  : $ram GB"
+          Write-Host "Disk : $([math]::Round($disk.Free / 1GB, 1)) GB free on C:"
+
+          # --- Power & Session Policies (Before RDP starts) ---
+          powercfg /change standby-timeout-ac 0 | Out-Null
+          powercfg /change monitor-timeout-ac 0 | Out-Null
+          powercfg /change hibernate-timeout-ac 0 | Out-Null
+
+          $ts = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
+          New-Item -Path $ts -Force | Out-Null
+          Set-ItemProperty -Path $ts -Name "MaxIdleTime" -Value 0 -Type DWord
+          Set-ItemProperty -Path $ts -Name "MaxDisconnectionTime" -Value 0 -Type DWord
+          Set-ItemProperty -Path $ts -Name "MaxConnectionTime" -Value 0 -Type DWord
+
+          # --- Enable Audio ---
+          Set-Service -Name Audiosrv -StartupType Automatic -ErrorAction SilentlyContinue
+          Start-Service -Name Audiosrv -ErrorAction SilentlyContinue
+
+          # --- Set Timezone ---
+          if (-not [string]::IsNullOrWhiteSpace($env:TZ_ID)) {
+            try { Set-TimeZone -Id $env:TZ_ID; Write-Host "Time zone set to: $($env:TZ_ID)" }
+            catch { Write-Warning "Invalid time zone ID: $($env:TZ_ID)" }
+          }
+
+          # --- Create Desktop Stop Shortcut ---
+          Set-Content -Path "C:\Users\Public\Desktop\STOP-SERVER.bat" -Value @(
+            '@echo off',
+            'echo stop> C:\stop.txt',
+            'echo The server will shut down within about a minute.',
+            'pause'
+          )
+
+          # --- Enable RDP & Firewall ---
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
-
-          # NLA on = safer. If your RDP client has trouble connecting, set this back to 0 (the original value).
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1
-
           Set-Service -Name TermService -StartupType Automatic
           Start-Service -Name TermService -ErrorAction SilentlyContinue
-
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-
-          # Only accept RDP from inside your Tailscale network (IPv4 + IPv6 ranges)
           Get-NetFirewallRule -DisplayGroup "Remote Desktop" |
             Set-NetFirewallRule -RemoteAddress @('100.64.0.0/10', 'fd7a:115c:a1e0::/48')
-
-          Write-Host "Remote Desktop enabled (reachable via Tailscale only)"
-          exit 0
+          Write-Host "Remote Desktop & Tuning configured successfully."
 
       - name: 2. Create Admin Account
         env:
           RDP_PASSWORD_SECRET: ${{ secrets.RDP_PASSWORD }}
         run: |
-          # Use the RDP_PASSWORD secret if you set one, otherwise generate a strong random password
           $plain = $env:RDP_PASSWORD_SECRET
           $source = "secret"
           if ([string]::IsNullOrWhiteSpace($plain)) {
@@ -78,27 +106,21 @@ jobs:
             [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
             $plain = ([Convert]::ToBase64String($bytes) -replace '[+/=]', 'x') + "aA1!"
             $source = "generated"
-            Write-Host "No RDP_PASSWORD secret found -> generated a random password (shown in the banner below)."
+            Write-Host "No RDP_PASSWORD secret found -> generated a random password."
           }
-
           "RDP_PASS=$plain" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "RDP_PASS_SOURCE=$source" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
           $secure = ConvertTo-SecureString $plain -AsPlainText -Force
-
           if (-not (Get-LocalUser -Name $env:RDP_USER -ErrorAction SilentlyContinue)) {
             New-LocalUser -Name $env:RDP_USER -Password $secure -FullName "Cloud RDP Admin" -PasswordNeverExpires -AccountNeverExpires | Out-Null
           } else {
             Set-LocalUser -Name $env:RDP_USER -Password $secure
           }
-
           Add-LocalGroupMember -Group "Administrators" -Member $env:RDP_USER -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member $env:RDP_USER -ErrorAction SilentlyContinue
-
           net user runneradmin "$plain" | Out-Null
-
           Write-Host "Account '$($env:RDP_USER)' is ready."
-          exit 0
 
       - name: 3. Install & Connect Tailscale VPN
         env:
@@ -108,36 +130,26 @@ jobs:
             throw "TAILSCALE_AUTHKEY secret is missing! Add it in: Settings > Secrets and variables > Actions."
           }
           $hostname = if ([string]::IsNullOrWhiteSpace($env:TS_HOSTNAME)) { "github-rdp-server" } else { $env:TS_HOSTNAME }
-
-          # Download Tailscale (with retries)
           $msi = Join-Path $env:RUNNER_TEMP "tailscale.msi"
           for ($i = 1; $i -le 3; $i++) {
             try {
               Invoke-WebRequest "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile $msi -UseBasicParsing
               break
             } catch {
-              Write-Host "Download attempt $i failed: $_"
               if ($i -eq 3) { throw }
               Start-Sleep -Seconds 5
             }
           }
-
-          # Install silently
           Start-Process msiexec -ArgumentList "/i `"$msi`" /quiet /norestart" -Wait
-
-          # Wait for the Tailscale service to come up
           for ($i = 1; $i -le 15; $i++) {
             $svc = Get-Service -Name "Tailscale" -ErrorAction SilentlyContinue
             if ($svc -and $svc.Status -eq "Running") { break }
             Start-Sleep -Seconds 2
           }
           Start-Sleep -Seconds 3
-
-          # Connect to Tailscale network
           & $env:TS_EXE up --authkey="$env:TAILSCALE_AUTHKEY" --hostname="$hostname" --unattended --accept-dns=false
-          if ($LASTEXITCODE -ne 0) { throw "tailscale up failed (check that your auth key is valid and not expired)." }
+          if ($LASTEXITCODE -ne 0) { throw "tailscale up failed (check your auth key)." }
 
-          # Wait until we get a Tailscale IP
           $ts_ip = $null
           for ($i = 1; $i -le 20; $i++) {
             $ts_ip = (& $env:TS_EXE ip -4 2>$null | Select-Object -First 1)
@@ -146,7 +158,6 @@ jobs:
           }
           if (-not $ts_ip) { throw "Tailscale did not get an IP in time." }
 
-          # MagicDNS name (nice to have)
           $dns = ""
           try {
             $status = & $env:TS_EXE status --json | ConvertFrom-Json
@@ -157,91 +168,66 @@ jobs:
           "TS_DNS=$dns" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
           $passText = if ($env:RDP_PASS_SOURCE -eq "generated") { $env:RDP_PASS } else { "(your RDP_PASSWORD secret)" }
-
           Write-Host ""
           Write-Host "==================================================" -ForegroundColor Green
-          Write-Host "  >>> RDP SERVER IS READY! <<<" -ForegroundColor Cyan
+          Write-Host "  >>> RDP NETWORK IS UP! (Installing tools next) <<<" -ForegroundColor Cyan
           Write-Host "  Tailscale IP : $ts_ip" -ForegroundColor Yellow
           if ($dns) { Write-Host "  DNS name     : $dns" -ForegroundColor Yellow }
           Write-Host "  Username     : $($env:RDP_USER)" -ForegroundColor Yellow
           Write-Host "  Password     : $passText" -ForegroundColor Yellow
-          Write-Host "  >> Open mstsc and connect to: $ts_ip" -ForegroundColor Magenta
           Write-Host "==================================================" -ForegroundColor Green
 
-          # Also show the connection info on the run summary page (the password is NOT written there)
           @"
-          ### 🖥️ RDP server is ready
-          | | |
+          ### 🖥️ RDP Server Connection Details
+          | Setting | Value |
           |---|---|
           | **Tailscale IP** | ``$ts_ip`` |
           | **DNS name** | ``$dns`` |
           | **Username** | ``$($env:RDP_USER)`` |
-          | **Password** | $(if ($env:RDP_PASS_SOURCE -eq 'generated') { 'random - see the step 3 log' } else { 'your RDP_PASSWORD secret' }) |
-
-          Open **mstsc** and connect to ``$ts_ip``. To stop early: run **STOP-SERVER.bat** on the desktop.
+          | **Password** | $(if ($env:RDP_PASS_SOURCE -eq 'generated') { 'Check Step 3 logs' } else { 'Your RDP_PASSWORD secret' }) |
           "@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
-          exit 0
 
-      - name: 4. System Info & Tuning
-        run: |
-          # --- Specs of this machine ---
-          $cpu  = (Get-CimInstance Win32_Processor | Select-Object -First 1)
-          $ram  = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 1)
-          $disk = Get-PSDrive C
-          Write-Host "CPU  : $($cpu.Name) ($($cpu.NumberOfLogicalProcessors) logical cores)"
-          Write-Host "RAM  : $ram GB"
-          Write-Host "Disk : $([math]::Round($disk.Free / 1GB, 1)) GB free on C:"
-
-          # --- Never sleep / never turn off the screen ---
-          powercfg /change standby-timeout-ac 0 | Out-Null
-          powercfg /change monitor-timeout-ac 0 | Out-Null
-          powercfg /change hibernate-timeout-ac 0 | Out-Null
-
-          # --- Keep your session alive even after you disconnect, no idle logoff ---
-          $ts = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
-          New-Item -Path $ts -Force | Out-Null
-          Set-ItemProperty -Path $ts -Name "MaxIdleTime" -Value 0 -Type DWord
-          Set-ItemProperty -Path $ts -Name "MaxDisconnectionTime" -Value 0 -Type DWord
-          Set-ItemProperty -Path $ts -Name "MaxConnectionTime" -Value 0 -Type DWord
-
-          # --- Audio over RDP ---
-          Set-Service -Name Audiosrv -StartupType Automatic -ErrorAction SilentlyContinue
-          Start-Service -Name Audiosrv -ErrorAction SilentlyContinue
-
-          # --- Optional time zone ---
-          if (-not [string]::IsNullOrWhiteSpace($env:TZ_ID)) {
-            try { Set-TimeZone -Id $env:TZ_ID; Write-Host "Time zone set to: $($env:TZ_ID)" }
-            catch { Write-Warning "Invalid time zone ID: $($env:TZ_ID)  (see: Get-TimeZone -ListAvailable)" }
-          }
-
-          # --- Desktop shortcut to stop the server from inside RDP ---
-          Set-Content -Path "C:\Users\Public\Desktop\STOP-SERVER.bat" -Value @(
-            '@echo off',
-            'echo stop> C:\stop.txt',
-            'echo The server will shut down within about a minute.',
-            'pause'
-          )
-          exit 0
-
-      - name: 5. Install Extra Tools
+      - name: 4. Install Extra Tools & AI Apps
         if: ${{ inputs.install_tools }}
         continue-on-error: true
         run: |
-          choco install vscode notepadplusplus 7zip vlc -y --no-progress
-          exit 0
+          Write-Host "1/4 Installing standard tools via Chocolatey (7-Zip is already pre-installed)..." -ForegroundColor Cyan
+          choco install vscode notepadplusplus vlc -y --no-progress --ignore-checksums
 
-      - name: 6. Keep Server Alive
+          Write-Host "2/4 Installing OpenCode..." -ForegroundColor Cyan
+          # نود جی‌اس روی سرورهای گیت‌هاب از قبل نصب است
+          npm install -g opencode-ai 2>$null
+          # اگر نسخه وینگت موجود باشد:
+          winget install --id SST.opencode -e --silent --accept-package-agreements --accept-source-agreements 2>$null
+
+          Write-Host "3/4 Installing Antigravity..." -ForegroundColor Cyan
+          # تلاش برای نصب از طریق Winget / NPM
+          winget install antigravity --silent --accept-package-agreements --accept-source-agreements 2>$null
+          npm install -g antigravity 2>$null
+          # نکته: اگر فایل نصبی مستقیم (.exe) دارید، لینک آن را در خط زیر جایگزین و از حالت کامنت خارج کنید:
+          # Invoke-WebRequest "https://YOUR-DIRECT-LINK/antigravity-setup.exe" -OutFile "$env:RUNNER_TEMP\ag.exe"; Start-Process "$env:RUNNER_TEMP\ag.exe" -ArgumentList "/S" -Wait
+
+          Write-Host "4/4 Installing QwenWork / Qwen Tools..." -ForegroundColor Cyan
+          npm install -g @qwen-code/qwen-code 2>$null
+          pip install qwen-agent 2>$null
+          # نکته: اگر منظور شما نسخه دسکتاپ خاصی با لینک مستقیم است، لینک آن را در خط زیر قرار دهید:
+          # Invoke-WebRequest "https://YOUR-DIRECT-LINK/qwenwork-setup.exe" -OutFile "$env:RUNNER_TEMP\qw.exe"; Start-Process "$env:RUNNER_TEMP\qw.exe" -ArgumentList "/S" -Wait
+
+          Write-Host "All requested tools processed!" -ForegroundColor Green
+
+      - name: 5. Keep Server Alive
         run: |
-          $maxMinutes = 340   # stay safely under GitHub's 360-minute job limit
+          $maxMinutes = 335   # حاشیه امنیت بیشتر برای جلوگیری از قطع ناگهانی توسط گیت‌هاب
           $minutes    = [math]::Min([double]::Parse($env:KEEP_HOURS, [Globalization.CultureInfo]::InvariantCulture) * 60, $maxMinutes)
           $deadline   = (Get-Date).AddMinutes($minutes)
           $idleLimit  = [int]$env:IDLE_MINUTES
           $lastActive = Get-Date
+          $startTime  = Get-Date
 
           Write-Host ""
-          Write-Host "  >> Server stays up for ~$([int]$minutes) minutes." -ForegroundColor Cyan
+          Write-Host "  >> ALL SET! Server stays up for ~$([int]$minutes) minutes." -ForegroundColor Green
           Write-Host "  >> Connect to: $($env:TS_IP)  |  user: $($env:RDP_USER)" -ForegroundColor Magenta
-          Write-Host "  >> Stop early: run STOP-SERVER.bat on the desktop (or create C:\stop.txt)" -ForegroundColor Magenta
+          Write-Host "  >> Stop early: run STOP-SERVER.bat on the desktop" -ForegroundColor Magenta
           Write-Host ""
 
           $i = 0
@@ -249,23 +235,21 @@ jobs:
             Start-Sleep -Seconds 60
             $i++
 
-            # Stop requested from inside the RDP session
             if (Test-Path "C:\stop.txt") {
               Write-Host "Stop file found -> shutting down."
               break
             }
 
-            # Is anybody connected over RDP right now?
             $connected = @(Get-NetTCPConnection -LocalPort 3389 -State Established -ErrorAction SilentlyContinue).Count -gt 0
             if ($connected) { $lastActive = Get-Date }
 
-            # Optional idle auto-stop (saves Actions minutes)
-            if ($idleLimit -gt 0 -and ((Get-Date) - $lastActive).TotalMinutes -ge $idleLimit) {
+            # حداقل 15 دقیقه اول به کاربر مهلت اتصال می‌دهد حتی اگر idle_minutes کمتر باشد
+            $uptime = ((Get-Date) - $startTime).TotalMinutes
+            if ($idleLimit -gt 0 -and $uptime -gt 15 -and ((Get-Date) - $lastActive).TotalMinutes -ge $idleLimit) {
               Write-Host "Nobody connected for $idleLimit minutes -> shutting down."
               break
             }
 
-            # Tailscale health check every 5 minutes
             if ($i % 5 -eq 0) {
               & $env:TS_EXE status *> $null
               if ($LASTEXITCODE -ne 0) {
@@ -276,14 +260,11 @@ jobs:
             }
 
             $left  = [int]($deadline - (Get-Date)).TotalMinutes
-            $state = if ($connected) { "connected" } else { "nobody connected" }
+            $state = if ($connected) { "Connected" } else { "Idle" }
             Write-Host "[$i] Server running... | RDP: $state | ~$left min left"
           }
-          exit 0
 
-      - name: 7. Cleanup
+      - name: 6. Cleanup
         if: always()
         run: |
-          # Remove this machine from your tailnet so no ghost device is left behind
           if (Test-Path $env:TS_EXE) { & $env:TS_EXE logout }
-          exit 0
